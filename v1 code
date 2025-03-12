@@ -12,13 +12,37 @@ conn = mysql.connector.connect(
 )
 cursor = conn.cursor()
 #headboy candidates
-HB1=0
+def HB1currentvotes():
+    sql = "SELECT votes FROM PC1votes WHERE candidate_name = %s"
+    values = ("damu",)
+    cursor.execute(sql, values)
+    result = cursor.fetchone()
+    return result[0] if result else 0
+HB1 = HB1currentvotes()
 #headgirl candidates
-HG1=0
+def HG1currentvotes():
+    sql = "SELECT votes FROM PC1votes WHERE candidate_name = %s"
+    values = ("anjAli",)
+    cursor.execute(sql, values)
+    result = cursor.fetchone()
+    return result[0] if result else 0
+HG1 = HG1currentvotes()
 #assistanboy candidates
-AB1=0
+def AB1currentvotes():
+    sql = "SELECT votes FROM PC1votes WHERE candidate_name = %s"
+    values = ("kollery",)
+    cursor.execute(sql, values)
+    result = cursor.fetchone()
+    return result[0] if result else 0
+AB1 = AB1currentvotes()
 #assistantgirl candidates
-AG1=0
+def AG1currentvotes():
+    sql = "SELECT votes FROM PC1votes WHERE candidate_name = %s"
+    values = ("nagavalli",)
+    cursor.execute(sql, values)
+    result = cursor.fetchone()
+    return result[0] if result else 0
+AG1 = AG1currentvotes()
 
 animation_running = False
 duration = 0.5
