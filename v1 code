@@ -123,7 +123,7 @@ def Headboy():
                     AG1 += 1
                     print(AG1)
                     sql = "UPDATE PC1votes SET votes = %s WHERE candidate_name = %s"
-                    values = (HG1, "nagavalli")
+                    values = (AG1, "nagavalli")
                     cursor.execute(sql, values)
                     conn.commit()
                     Assigirlpage.destroy()
@@ -195,7 +195,7 @@ def Headboy():
                 AB1 += 1
                 print(AB1)
                 sql = "UPDATE PC1votes SET votes = %s WHERE candidate_name = %s"
-                values = (HG1, "kollery")
+                values = (AB1, "kollery")
                 cursor.execute(sql, values)
                 conn.commit()
                 Assistantheadgirl()
@@ -389,5 +389,6 @@ def Headboy():
         widget.bind("<Leave>", on_leave)
 
     #HB candidate2
-    root.mainloop()
 Headboy()
+root.mainloop()
+
