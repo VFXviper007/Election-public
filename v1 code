@@ -2,6 +2,15 @@ from tkinter import *
 from customtkinter import *
 import sounddevice as sd
 import numpy as np
+import mysql.connector
+
+conn = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    passwd="root",
+    database="election"
+)
+cursor = conn.cursor()
 #headboy candidates
 HB1=0
 #headgirl candidates
@@ -59,6 +68,8 @@ def Headboy():
             Assiboypage.iconphoto(True, icon)
             heading = Label(topframe, text="ELECTION 2025", font=('Ariel', 40, 'bold'), fg='#ffffff', bg='#084ca4')
             heading.pack(pady=20)
+            rounded_frame = CTkFrame(Assiboypage, width=250, height=360, corner_radius=30, fg_color="#ffffff")
+            rounded_frame.place(x=200, y=200)
 
             def Assistantheadgirl():
                 Assiboypage.destroy()
@@ -72,18 +83,25 @@ def Headboy():
                 Assigirlpage.iconphoto(True, icon)
                 heading = Label(topframe, text="ELECTION 2025", font=('Ariel', 40, 'bold'), fg='#ffffff', bg='#084ca4')
                 heading.pack(pady=20)
+                rounded_frame = CTkFrame(Assigirlpage, width=250, height=360, corner_radius=30, fg_color="#ffffff")
+                rounded_frame.place(x=200, y=200)
                 # AGcandidate1
                 global AG1img
                 Assigirlpage.AG1img = PhotoImage(file='nagavalli.png')
-                candidate1cord = Label(Assigirlpage, image=Assigirlpage.AG1img)
-                candidate1cord.place(x=1250, y=220)
-                candidate1name = Label(Assigirlpage, text="Nagavalli", font=('Ariel', 20), bg='#ffffff')
-                candidate1name.place(x=60, y=270)
+                candidate1cord = Label(rounded_frame, image=Assigirlpage.AG1img)
+                candidate1cord.place(x=40, y=20)
+                candidate1name = Label(rounded_frame, text="nagavalli", font=('Ariel', 18), bg='#ffffff', fg='#084ca4')
+                candidate1name.place(x=85, y=274)
+
 
                 def AG1vote():
                     global AG1
                     AG1 += 1
                     print(AG1)
+                    sql = "UPDATE PC1votes SET votes = %s WHERE candidate_name = %s"
+                    values = (HG1, "nagavalli")
+                    cursor.execute(sql, values)
+                    conn.commit()
                     Assigirlpage.destroy()
                     t = np.linspace(0, duration, int(fs * duration), endpoint=False)
                     beep = 0.5 * np.sin(2 * np.pi * frequency * t)
@@ -91,26 +109,121 @@ def Headboy():
                     sd.wait()
                     Headboy()
 
+                candidate1button = CTkButton(rounded_frame, text='Vote', command=AG1vote, font=("Ariel", 20),
+                                             text_color='#ffffff', fg_color='#084ca4', corner_radius=30, width=35,
+                                             height=35)
+                candidate1button.place(x=85, y=310)
 
-                candidate1button = CTkButton(Assigirlpage, text='Vote', command=AG1vote, font=("Ariel", 20),text_color='#ffffff',fg_color='#084ca4',corner_radius=30,width=40,height=40)
-                candidate1button.place(x=60, y=340)
+                def animate(y_start, y_end, step=2, delay=10):
+                    """Smooth animation with state management."""
+                    global animation_running
+
+                    if animation_running:
+                        return
+
+                    animation_running = True
+
+                    def step_motion():
+                        nonlocal y_start
+                        if abs(y_start - y_end) > step:
+                            y_start += step if y_start < y_end else -step
+                            rounded_frame.place(y=y_start)
+                            root.after(delay, step_motion)
+                        else:
+                            rounded_frame.place(y=y_end)
+                            global animation_running
+                            animation_running = False
+
+                    step_motion()
+
+                def on_enter(event):
+                    global hovering
+                    hovering = True
+                    animate(rounded_frame.winfo_y(), 180)  # Move up
+
+                def on_leave(event):
+                    global hovering
+                    hovering = False
+                    root.after(50, check_leave)  # Small delay to prevent flickering
+
+                def check_leave():
+                    """Ensures mouse has fully left before moving down."""
+                    if not hovering:
+                        animate(rounded_frame.winfo_y(), 200)  # Move down
+
+                # Bind events to the entire frame including children
+                rounded_frame.bind("<Enter>", on_enter)
+                rounded_frame.bind("<Leave>", on_leave)
+                for widget in rounded_frame.winfo_children():  # Apply to child widgets
+                    widget.bind("<Enter>", on_enter)
+                    widget.bind("<Leave>", on_leave)
 
             # ABcandidate1
             global AB1img
             Assiboypage.AB1img = PhotoImage(file='kollery.png')
-            candidate1cord = Label(Assiboypage, image=Assiboypage.AB1img)
-            candidate1cord.place(x=1250, y=220)
-            candidate1name = Label(Assiboypage, text="Kollery", font=('Ariel', 20), bg='#ffffff')
-            candidate1name.place(x=60, y=270)
+            candidate1cord = Label(rounded_frame, image=Assiboypage.AB1img)
+            candidate1cord.place(x=40, y=20)
+            candidate1name = Label(rounded_frame, text="Kollery", font=('Ariel', 18), bg='#ffffff', fg='#084ca4')
+            candidate1name.place(x=85, y=274)
 
             def AB1vote():
                 global AB1
                 AB1 += 1
                 print(AB1)
+                sql = "UPDATE PC1votes SET votes = %s WHERE candidate_name = %s"
+                values = (HG1, "kollery")
+                cursor.execute(sql, values)
+                conn.commit()
                 Assistantheadgirl()
 
-            candidate1button = CTkButton(Assiboypage, text='Vote', command=AB1vote, font=("Ariel",20),text_color='#ffffff',fg_color='#084ca4',corner_radius=30,width=40,height=40)
-            candidate1button.place(x=60, y=340)
+            candidate1button = CTkButton(rounded_frame, text='Vote', command=AB1vote, font=("Ariel", 20),
+                                         text_color='#ffffff', fg_color='#084ca4', corner_radius=30, width=35,
+                                         height=35)
+            candidate1button.place(x=85, y=310)
+
+            def animate(y_start, y_end, step=2, delay=10):
+                """Smooth animation with state management."""
+                global animation_running
+
+                if animation_running:
+                    return
+
+                animation_running = True
+
+                def step_motion():
+                    nonlocal y_start
+                    if abs(y_start - y_end) > step:
+                        y_start += step if y_start < y_end else -step
+                        rounded_frame.place(y=y_start)
+                        root.after(delay, step_motion)
+                    else:
+                        rounded_frame.place(y=y_end)
+                        global animation_running
+                        animation_running = False
+
+                step_motion()
+
+            def on_enter(event):
+                global hovering
+                hovering = True
+                animate(rounded_frame.winfo_y(), 180)  # Move up
+
+            def on_leave(event):
+                global hovering
+                hovering = False
+                root.after(50, check_leave)  # Small delay to prevent flickering
+
+            def check_leave():
+                """Ensures mouse has fully left before moving down."""
+                if not hovering:
+                    animate(rounded_frame.winfo_y(), 200)  # Move down
+
+            # Bind events to the entire frame including children
+            rounded_frame.bind("<Enter>", on_enter)
+            rounded_frame.bind("<Leave>", on_leave)
+            for widget in rounded_frame.winfo_children():  # Apply to child widgets
+                widget.bind("<Enter>", on_enter)
+                widget.bind("<Leave>", on_leave)
             # ABcandidate2
             # ABcandidate3
             # ABcandidate4
@@ -127,6 +240,10 @@ def Headboy():
             global HG1
             HG1 += 1
             print(HG1)
+            sql = "UPDATE PC1votes SET votes = %s WHERE candidate_name = %s"
+            values = (HG1, "anjAli")
+            cursor.execute(sql, values)
+            conn.commit()
             AssistantHeadboy()
 
         candidate1button = CTkButton(rounded_frame, text='Vote', command=HG1vote, font=("Ariel", 20),text_color='#ffffff',fg_color='#084ca4',corner_radius=30,width=35,height=35)
@@ -193,6 +310,10 @@ def Headboy():
         global HB1
         HB1 += 1
         print(HB1)
+        sql = "UPDATE PC1votes SET votes = %s WHERE candidate_name = %s"
+        values = (HB1, "damu")
+        cursor.execute(sql, values)
+        conn.commit()
         Headgirl()
 
     candidate1button = CTkButton(rounded_frame, text='Vote', command=HB1vote, font=("Ariel", 20), text_color='#ffffff',
