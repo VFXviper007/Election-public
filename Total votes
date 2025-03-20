@@ -1,0 +1,72 @@
+import mysql.connector
+import sched
+import time
+scheduler = sched.scheduler(time.time, time.sleep)
+conn = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    passwd="root",
+    database="election"
+)
+cursor = conn.cursor()
+def total():
+    sql = "SELECT HB1 FROM test WHERE PC = %s"
+    values = ("PC1votes",)
+    cursor.execute(sql, values)
+    PC1HB1 = cursor.fetchone()[0]
+
+    sql = "SELECT HB1 FROM test WHERE PC = %s"
+    values = ("PC2votes",)
+    cursor.execute(sql, values)
+    PC2HB1 = cursor.fetchone()[0]
+
+    sql = "SELECT HG1 FROM test WHERE PC = %s"
+    values = ("PC1votes",)
+    cursor.execute(sql, values)
+    PC1HG1 = cursor.fetchone()[0]
+
+    sql = "SELECT HG1 FROM test WHERE PC = %s"
+    values = ("PC2votes",)
+    cursor.execute(sql, values)
+    PC2HG1 = cursor.fetchone()[0]
+
+    sql = "SELECT AB1 FROM test WHERE PC = %s"
+    values = ("PC1votes",)
+    cursor.execute(sql, values)
+    PC1AB1 = cursor.fetchone()[0]
+
+    sql = "SELECT AB1 FROM test WHERE PC = %s"
+    values = ("PC2votes",)
+    cursor.execute(sql, values)
+    PC2AB1 = cursor.fetchone()[0]
+
+    sql = "SELECT AG1 FROM test WHERE PC = %s"
+    values = ("PC1votes",)
+    cursor.execute(sql, values)
+    PC1AG1 = cursor.fetchone()[0]
+
+    sql = "SELECT AG1 FROM test WHERE PC = %s"
+    values = ("PC2votes",)
+    cursor.execute(sql, values)
+    PC2AG1 = cursor.fetchone()[0]
+
+    HB1total = PC1HB1 + PC2HB1
+    HG1total = PC1HG1 + PC2HG1
+    AB1total = PC1AB1 + PC2AB1
+    AG1total = PC1AG1 + PC2AG1
+
+    insertHB1 = "UPDATE total SET votes=%s where Candidate='HB1'"
+    cursor.execute(insertHB1, (HB1total,))
+    conn.commit()
+    insertHG1 = "UPDATE total SET votes=%s where Candidate='HG1'"
+    cursor.execute(insertHG1, (HG1total,))
+    conn.commit()
+    insertAB1 = "UPDATE total SET votes=%s where Candidate='AB1'"
+    cursor.execute(insertAB1, (AB1total,))
+    conn.commit()
+    insertAG1 = "UPDATE total SET votes=%s where Candidate='AG1'"
+    cursor.execute(insertAG1, (AG1total,))
+    conn.commit()
+    scheduler.enter(660, 1, total)
+scheduler.enter(660, 1, total)
+scheduler.run()
