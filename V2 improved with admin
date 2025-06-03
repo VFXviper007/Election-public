@@ -1,0 +1,752 @@
+from tkinter import *
+from customtkinter import *
+import sounddevice as sd
+import numpy as np
+import mysql.connector
+from datetime import datetime
+import hashlib
+import tkinter.messagebox as messagebox
+
+# Set CustomTkinter appearance
+set_appearance_mode("light")
+set_default_color_theme("blue")
+
+# Database connection
+conn = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    passwd="root",
+    database="election"
+)
+cursor = conn.cursor()
+
+# Admin password (hashed for security)
+ADMIN_PASSWORD_HASH = hashlib.sha256("admin123".encode()).hexdigest()  # Change this password
+
+# Global variables
+animation_running = False
+duration = 0.3
+fs = 44100
+frequency = 800
+
+
+class DatabaseManager:
+    """Handles all database operations"""
+
+    @staticmethod
+    def initialize_database():
+        """Create necessary tables if they don't exist"""
+        try:
+            # Create candidates table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS candidates (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    category VARCHAR(100) NOT NULL,
+                    image_path VARCHAR(255),
+                    votes INT DEFAULT 0,
+                    active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Create voting_status table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS voting_status (
+                    id INT PRIMARY KEY DEFAULT 1,
+                    is_active BOOLEAN DEFAULT FALSE,
+                    started_at TIMESTAMP NULL,
+                    ended_at TIMESTAMP NULL
+                )
+            """)
+
+            # Insert default voting status if not exists
+            cursor.execute("INSERT IGNORE INTO voting_status (id, is_active) VALUES (1, FALSE)")
+
+            conn.commit()
+            print("Database initialized successfully")
+        except Exception as e:
+            print(f"Database initialization error: {e}")
+
+    @staticmethod
+    def get_candidates_by_category(category):
+        """Get all active candidates for a specific category"""
+        sql = "SELECT id, name, image_path, votes FROM candidates WHERE category = %s AND active = TRUE"
+        cursor.execute(sql, (category,))
+        return cursor.fetchall()
+
+    @staticmethod
+    def add_candidate(name, category, image_path=""):
+        """Add a new candidate"""
+        sql = "INSERT INTO candidates (name, category, image_path) VALUES (%s, %s, %s)"
+        cursor.execute(sql, (name, category, image_path))
+        conn.commit()
+        return cursor.lastrowid
+
+    @staticmethod
+    def update_candidate_votes(candidate_id, votes):
+        """Update candidate vote count"""
+        sql = "UPDATE candidates SET votes = %s WHERE id = %s"
+        cursor.execute(sql, (votes, candidate_id))
+        conn.commit()
+
+    @staticmethod
+    def get_voting_status():
+        """Check if voting is currently active"""
+        cursor.execute("SELECT is_active FROM voting_status WHERE id = 1")
+        result = cursor.fetchone()
+        return result[0] if result else False
+
+    @staticmethod
+    def set_voting_status(status):
+        """Set voting active/inactive"""
+        if status:
+            sql = "UPDATE voting_status SET is_active = TRUE, started_at = NOW() WHERE id = 1"
+        else:
+            sql = "UPDATE voting_status SET is_active = FALSE, ended_at = NOW() WHERE id = 1"
+        cursor.execute(sql)
+        conn.commit()
+
+    @staticmethod
+    def delete_candidate(candidate_id):
+        """Soft delete a candidate"""
+        sql = "UPDATE candidates SET active = FALSE WHERE id = %s"
+        cursor.execute(sql, (candidate_id,))
+        conn.commit()
+
+    @staticmethod
+    def reset_all_votes():
+        """Reset all vote counts to 0"""
+        sql = "UPDATE candidates SET votes = 0"
+        cursor.execute(sql)
+        conn.commit()
+
+
+class AdminPanel:
+    """Admin interface for managing candidates and voting"""
+
+    def __init__(self, parent_app):
+        self.parent_app = parent_app
+        self.admin_window = None
+        self.categories = ["HEAD BOY", "HEAD GIRL", "ASSISTANT HEAD BOY", "ASSISTANT HEAD GIRL"]
+
+    def show_login(self):
+        """Show admin login dialog"""
+        login_window = CTkToplevel(self.parent_app.root)
+        login_window.title("Admin Login")
+        login_window.geometry("400x300")
+        login_window.resizable(False, False)
+
+        # Center the login window
+        login_window.update_idletasks()
+        x = (login_window.winfo_screenwidth() // 2) - (200)
+        y = (login_window.winfo_screenheight() // 2) - (150)
+        login_window.geometry(f"400x300+{x}+{y}")
+
+        login_window.grab_set()  # Make window modal
+
+        # Login form
+        CTkLabel(login_window, text="Admin Access",
+                 font=CTkFont(size=24, weight="bold")).pack(pady=30)
+
+        CTkLabel(login_window, text="Enter Admin Password:",
+                 font=CTkFont(size=14)).pack(pady=10)
+
+        password_entry = CTkEntry(login_window, show="*", width=250, height=40,
+                                  font=CTkFont(size=14))
+        password_entry.pack(pady=10)
+        password_entry.focus()
+
+        error_label = CTkLabel(login_window, text="", text_color="red")
+        error_label.pack(pady=5)
+
+        def verify_password():
+            entered_password = password_entry.get()
+            if hashlib.sha256(entered_password.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
+                login_window.destroy()
+                self.show_admin_panel()
+            else:
+                error_label.configure(text="Invalid password!")
+                password_entry.delete(0, END)
+
+        def on_enter(event):
+            verify_password()
+
+        password_entry.bind("<Return>", on_enter)
+
+        CTkButton(login_window, text="Login", command=verify_password,
+                  width=150, height=40).pack(pady=20)
+
+        CTkButton(login_window, text="Cancel",
+                  command=login_window.destroy,
+                  width=150, height=40).pack(pady=5)
+
+    def show_admin_panel(self):
+        """Show the main admin panel"""
+        self.admin_window = CTkToplevel(self.parent_app.root)
+        self.admin_window.title("Election Admin Panel")
+        self.admin_window.geometry("1000x700")
+
+        # Center the admin window
+        self.admin_window.update_idletasks()
+        x = (self.admin_window.winfo_screenwidth() // 2) - (500)
+        y = (self.admin_window.winfo_screenheight() // 2) - (350)
+        self.admin_window.geometry(f"1000x700+{x}+{y}")
+
+        self.admin_window.grab_set()
+
+        # Header
+        header = CTkFrame(self.admin_window, height=80, corner_radius=0,
+                          fg_color=("#1e3a8a", "#1e40af"))
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        CTkLabel(header, text="Election Administration Panel",
+                 font=CTkFont(size=28, weight="bold"),
+                 text_color="white").pack(pady=25)
+
+        # Main content
+        main_frame = CTkFrame(self.admin_window, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Left panel - Controls
+        left_panel = CTkFrame(main_frame, width=300, corner_radius=10)
+        left_panel.pack(side="left", fill="y", padx=(0, 10))
+        left_panel.pack_propagate(False)
+
+        # Voting control section
+        CTkLabel(left_panel, text="Voting Control",
+                 font=CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+        self.voting_status_label = CTkLabel(left_panel, text="",
+                                            font=CTkFont(size=14))
+        self.voting_status_label.pack(pady=5)
+
+        self.toggle_voting_btn = CTkButton(left_panel, text="",
+                                           command=self.toggle_voting,
+                                           width=200, height=40)
+        self.toggle_voting_btn.pack(pady=10)
+
+        # Candidate management
+        CTkLabel(left_panel, text="Candidate Management",
+                 font=CTkFont(size=18, weight="bold")).pack(pady=(30, 10))
+
+        CTkButton(left_panel, text="Add Candidate",
+                  command=self.show_add_candidate,
+                  width=200, height=40).pack(pady=5)
+
+        CTkButton(left_panel, text="Reset All Votes",
+                  command=self.reset_votes,
+                  width=200, height=40,
+                  fg_color="orange", hover_color="darkorange").pack(pady=5)
+
+        CTkButton(left_panel, text="Close Admin Panel",
+                  command=self.admin_window.destroy,
+                  width=200, height=40,
+                  fg_color="red", hover_color="darkred").pack(pady=(30, 20))
+
+        # Right panel - Candidate list
+        right_panel = CTkFrame(main_frame, corner_radius=10)
+        right_panel.pack(side="right", fill="both", expand=True)
+
+        CTkLabel(right_panel, text="Current Candidates",
+                 font=CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+        # Scrollable frame for candidates
+        self.candidates_frame = CTkScrollableFrame(right_panel, height=500)
+        self.candidates_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        self.update_voting_status_display()
+        self.refresh_candidates_list()
+
+    def update_voting_status_display(self):
+        """Update the voting status display"""
+        if hasattr(self, 'voting_status_label'):
+            is_active = DatabaseManager.get_voting_status()
+            if is_active:
+                self.voting_status_label.configure(text="Status: VOTING ACTIVE", text_color="green")
+                self.toggle_voting_btn.configure(text="Stop Voting", fg_color="red", hover_color="darkred")
+            else:
+                self.voting_status_label.configure(text="Status: VOTING STOPPED", text_color="red")
+                self.toggle_voting_btn.configure(text="Start Voting", fg_color="green", hover_color="darkgreen")
+
+    def toggle_voting(self):
+        """Toggle voting status"""
+        current_status = DatabaseManager.get_voting_status()
+        new_status = not current_status
+        DatabaseManager.set_voting_status(new_status)
+        self.update_voting_status_display()
+
+        # Update parent app status
+        if hasattr(self.parent_app, 'update_voting_access'):
+            self.parent_app.update_voting_access()
+
+        status_text = "started" if new_status else "stopped"
+        messagebox.showinfo("Voting Status", f"Voting has been {status_text}!")
+
+    def show_add_candidate(self):
+        """Show add candidate dialog"""
+        add_window = CTkToplevel(self.admin_window)
+        add_window.title("Add Candidate")
+        add_window.geometry("400x400")
+        add_window.grab_set()
+
+        # Center window
+        add_window.update_idletasks()
+        x = (add_window.winfo_screenwidth() // 2) - (200)
+        y = (add_window.winfo_screenheight() // 2) - (200)
+        add_window.geometry(f"400x400+{x}+{y}")
+
+        CTkLabel(add_window, text="Add New Candidate",
+                 font=CTkFont(size=20, weight="bold")).pack(pady=20)
+
+        # Name input
+        CTkLabel(add_window, text="Candidate Name:").pack(pady=(10, 5))
+        name_entry = CTkEntry(add_window, width=250, height=35)
+        name_entry.pack(pady=5)
+
+        # Category selection
+        CTkLabel(add_window, text="Category:").pack(pady=(15, 5))
+        category_var = StringVar(value=self.categories[0])
+        category_menu = CTkOptionMenu(add_window, values=self.categories,
+                                      variable=category_var, width=250)
+        category_menu.pack(pady=5)
+
+        # Image path input
+        CTkLabel(add_window, text="Image Path (optional):").pack(pady=(15, 5))
+        image_entry = CTkEntry(add_window, width=250, height=35)
+        image_entry.pack(pady=5)
+
+        def add_candidate():
+            name = name_entry.get().strip()
+            category = category_var.get()
+            image_path = image_entry.get().strip()
+
+            if not name:
+                messagebox.showerror("Error", "Please enter candidate name!")
+                return
+
+            try:
+                DatabaseManager.add_candidate(name, category, image_path)
+                messagebox.showinfo("Success", f"Candidate '{name}' added successfully!")
+                add_window.destroy()
+                self.refresh_candidates_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to add candidate: {e}")
+
+        CTkButton(add_window, text="Add Candidate", command=add_candidate,
+                  width=150, height=40).pack(pady=20)
+
+        CTkButton(add_window, text="Cancel", command=add_window.destroy,
+                  width=150, height=40).pack(pady=5)
+
+    def refresh_candidates_list(self):
+        """Refresh the candidates list display"""
+        if not hasattr(self, 'candidates_frame'):
+            return
+
+        # Clear existing widgets
+        for widget in self.candidates_frame.winfo_children():
+            widget.destroy()
+
+        # Display candidates by category
+        for category in self.categories:
+            candidates = DatabaseManager.get_candidates_by_category(category)
+
+            # Category header
+            category_frame = CTkFrame(self.candidates_frame, fg_color="transparent")
+            category_frame.pack(fill="x", pady=(10, 5))
+
+            CTkLabel(category_frame, text=category,
+                     font=CTkFont(size=16, weight="bold"),
+                     text_color="#1e40af").pack(anchor="w")
+
+            if not candidates:
+                CTkLabel(category_frame, text="No candidates added",
+                         text_color="gray").pack(anchor="w", padx=20)
+            else:
+                for candidate_id, name, image_path, votes in candidates:
+                    candidate_frame = CTkFrame(self.candidates_frame)
+                    candidate_frame.pack(fill="x", pady=2, padx=10)
+
+                    # Candidate info
+                    info_frame = CTkFrame(candidate_frame, fg_color="transparent")
+                    info_frame.pack(side="left", fill="x", expand=True, padx=10, pady=10)
+
+                    CTkLabel(info_frame, text=name,
+                             font=CTkFont(size=14, weight="bold")).pack(anchor="w")
+                    CTkLabel(info_frame, text=f"Votes: {votes}",
+                             font=CTkFont(size=12)).pack(anchor="w")
+                    if image_path:
+                        CTkLabel(info_frame, text=f"Image: {image_path}",
+                                 font=CTkFont(size=10), text_color="gray").pack(anchor="w")
+
+                    # Delete button
+                    CTkButton(candidate_frame, text="Delete",
+                              command=lambda cid=candidate_id, cname=name: self.delete_candidate(cid, cname),
+                              width=80, height=30,
+                              fg_color="red", hover_color="darkred").pack(side="right", padx=10, pady=10)
+
+    def delete_candidate(self, candidate_id, candidate_name):
+        """Delete a candidate after confirmation"""
+        result = messagebox.askyesno("Confirm Delete",
+                                     f"Are you sure you want to delete '{candidate_name}'?")
+        if result:
+            try:
+                DatabaseManager.delete_candidate(candidate_id)
+                messagebox.showinfo("Success", f"Candidate '{candidate_name}' deleted!")
+                self.refresh_candidates_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete candidate: {e}")
+
+    def reset_votes(self):
+        """Reset all votes after confirmation"""
+        result = messagebox.askyesno("Confirm Reset",
+                                     "Are you sure you want to reset all votes to 0?")
+        if result:
+            try:
+                DatabaseManager.reset_all_votes()
+                messagebox.showinfo("Success", "All votes have been reset to 0!")
+                self.refresh_candidates_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to reset votes: {e}")
+
+
+class ElectionApp:
+    def __init__(self):
+        # Initialize database
+        DatabaseManager.initialize_database()
+
+        self.root = CTk()
+        self.root.geometry("1400x900")
+        self.root.title("BVBVM Election Management System")
+        self.root.configure(fg_color="#f0f4f8")
+
+        # Center the window
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() // 2) - (700)
+        y = (self.root.winfo_screenheight() // 2) - (450)
+        self.root.geometry(f"1400x900+{x}+{y}")
+
+        try:
+            icon = PhotoImage(file='bvblogo2.png')
+            self.root.iconphoto(True, icon)
+        except:
+            pass
+
+        self.current_category = 0
+        self.categories = ["HEAD BOY", "HEAD GIRL", "ASSISTANT HEAD BOY", "ASSISTANT HEAD GIRL"]
+        self.total_voters = 0
+        self.current_candidates = []
+        self.current_candidate_index = 0
+
+        # Initialize admin panel
+        self.admin_panel = AdminPanel(self)
+
+        self.setup_ui()
+        self.update_voting_access()
+
+    def setup_ui(self):
+        # Header section with gradient-like effect
+        self.header_frame = CTkFrame(self.root, height=120, corner_radius=0,
+                                     fg_color=("#1e3a8a", "#1e40af"))
+        self.header_frame.pack(fill="x", padx=0, pady=0)
+        self.header_frame.pack_propagate(False)
+
+        # Logo and title container
+        self.title_container = CTkFrame(self.header_frame, fg_color="transparent")
+        self.title_container.pack(expand=True, fill="both")
+
+        # Main title
+        self.main_title = CTkLabel(self.title_container,
+                                   text="BVBVM ELECTION SYSTEM 2025",
+                                   font=CTkFont(family="Segoe UI", size=36, weight="bold"),
+                                   text_color="white")
+        self.main_title.pack(pady=(20, 5))
+
+        # Subtitle
+        self.subtitle = CTkLabel(self.title_container,
+                                 text="Digital Voting Platform",
+                                 font=CTkFont(family="Segoe UI", size=16, weight="normal"),
+                                 text_color="#cbd5e1")
+        self.subtitle.pack()
+
+        # Admin button (top right)
+        self.admin_btn = CTkButton(self.header_frame, text="Admin",
+                                   command=self.admin_panel.show_login,
+                                   width=80, height=30,
+                                   fg_color="transparent", border_width=1,
+                                   border_color="white", text_color="white")
+        self.admin_btn.place(relx=0.95, rely=0.2, anchor="ne")
+
+        # Status bar
+        self.status_frame = CTkFrame(self.root, height=50, corner_radius=0,
+                                     fg_color=("#e2e8f0", "#f1f5f9"))
+        self.status_frame.pack(fill="x", padx=0, pady=0)
+        self.status_frame.pack_propagate(False)
+
+        # Current time and status
+        self.status_left = CTkLabel(self.status_frame,
+                                    text=f"Session: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                                    font=CTkFont(family="Segoe UI", size=12),
+                                    text_color="#64748b")
+        self.status_left.pack(side="left", padx=20, pady=15)
+
+        self.status_right = CTkLabel(self.status_frame,
+                                     text="Status: Ready",
+                                     font=CTkFont(family="Segoe UI", size=12),
+                                     text_color="#059669")
+        self.status_right.pack(side="right", padx=20, pady=15)
+
+        # Main content area
+        self.main_frame = CTkFrame(self.root, fg_color="transparent")
+        self.main_frame.pack(fill="both", expand=True, padx=30, pady=20)
+
+        # Category indicator with better styling
+        self.category_frame = CTkFrame(self.main_frame, height=80, corner_radius=15,
+                                       fg_color=("#ffffff", "#f8fafc"),
+                                       border_width=1, border_color="#e2e8f0")
+        self.category_frame.pack(fill="x", pady=(0, 20))
+        self.category_frame.pack_propagate(False)
+
+        self.category_label = CTkLabel(self.category_frame, text="",
+                                       font=CTkFont(family="Segoe UI", size=28, weight="bold"),
+                                       text_color="#1e40af")
+        self.category_label.pack(expand=True)
+
+        # Voting area
+        self.voting_container = CTkFrame(self.main_frame, fg_color="transparent")
+        self.voting_container.pack(fill="both", expand=True)
+
+        # Create candidate card with professional styling
+        self.candidate_card = CTkFrame(self.voting_container,
+                                       width=400, height=600,
+                                       corner_radius=20,
+                                       fg_color=("#ffffff", "#f8fafc"),
+                                       border_width=2, border_color="#e2e8f0")
+        self.candidate_card.place(relx=0.5, rely=0.5, anchor="center")
+
+    def update_voting_access(self):
+        """Update UI based on voting status"""
+        is_voting_active = DatabaseManager.get_voting_status()
+
+        if is_voting_active:
+            self.display_category()
+            self.status_right.configure(text="Status: Voting Active", text_color="#059669")
+        else:
+            self.show_voting_inactive_message()
+            self.status_right.configure(text="Status: Voting Inactive", text_color="#dc2626")
+
+    def show_voting_inactive_message(self):
+        """Show message when voting is inactive"""
+        self.clear_candidate_card()
+        self.category_label.configure(text="VOTING NOT ACTIVE")
+
+        # Show message in candidate card
+        message_label = CTkLabel(self.candidate_card,
+                                 text="Voting is currently not active.\nPlease wait for voting to begin.",
+                                 font=CTkFont(family="Segoe UI", size=18),
+                                 text_color="#64748b")
+        message_label.pack(expand=True)
+
+    def clear_candidate_card(self):
+        for widget in self.candidate_card.winfo_children():
+            widget.destroy()
+
+    def play_success_sound(self):
+        # More pleasant success sound
+        t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+        # Two-tone success sound
+        tone1 = 0.3 * np.sin(2 * np.pi * 600 * t)
+        tone2 = 0.3 * np.sin(2 * np.pi * 800 * t)
+        success_sound = tone1 + tone2
+        # Apply fade out
+        fade = np.linspace(1, 0, len(success_sound))
+        success_sound *= fade
+        sd.play(success_sound, samplerate=fs)
+
+    def update_status(self, message, color="#059669"):
+        self.status_right.configure(text=f"Status: {message}", text_color=color)
+
+    def next_category(self):
+        self.current_category += 1
+        if self.current_category >= len(self.categories):
+            self.show_completion_message()
+        else:
+            self.display_category()
+
+    def show_completion_message(self):
+        # Hide the candidate card
+        self.candidate_card.place_forget()
+
+        self.category_label.configure(text="VOTING COMPLETED")
+        self.update_status("Vote Submitted Successfully", "#059669")
+
+        # Success icon (using text symbol) - displayed on main screen
+        success_icon = CTkLabel(self.voting_container,
+                                text="✓",
+                                font=CTkFont(family="Segoe UI", size=120, weight="bold"),
+                                text_color="#10b981")
+        success_icon.place(relx=0.5, rely=0.25, anchor="center")
+
+        # Thank you message - displayed on main screen
+        thank_you = CTkLabel(self.voting_container,
+                             text="Thank You for Voting!",
+                             font=CTkFont(family="Segoe UI", size=36, weight="bold"),
+                             text_color="#1e40af")
+        thank_you.place(relx=0.5, rely=0.4, anchor="center")
+
+        # Sub message - displayed on main screen
+        sub_message = CTkLabel(self.voting_container,
+                               text="Your vote has been recorded securely",
+                               font=CTkFont(family="Segoe UI", size=18),
+                               text_color="#64748b")
+        sub_message.place(relx=0.5, rely=0.5, anchor="center")
+
+        # New voter button - displayed on main screen
+        new_voter_btn = CTkButton(self.voting_container,
+                                  text="New Voter",
+                                  command=self.restart_voting,
+                                  font=CTkFont(family="Segoe UI", size=18, weight="bold"),
+                                  fg_color="#1e40af",
+                                  hover_color="#1e3a8a",
+                                  corner_radius=12,
+                                  width=200,
+                                  height=50)
+        new_voter_btn.place(relx=0.5, rely=0.65, anchor="center")
+
+        # Update total voters count
+        self.total_voters += 1
+
+    def restart_voting(self):
+        # Clear all completion message elements
+        for widget in self.voting_container.winfo_children():
+            if widget != self.candidate_card:
+                widget.destroy()
+
+        # Show the candidate card again
+        self.candidate_card.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.current_category = 0
+        self.current_candidate_index = 0
+        self.update_status("Ready", "#059669")
+
+        # Check if voting is still active
+        if DatabaseManager.get_voting_status():
+            self.display_category()
+        else:
+            self.show_voting_inactive_message()
+
+    def display_category(self):
+        if not DatabaseManager.get_voting_status():
+            self.show_voting_inactive_message()
+            return
+
+        self.clear_candidate_card()
+        self.category_label.configure(text=f"SELECT {self.categories[self.current_category]}")
+        self.update_status("Voting in Progress", "#2563eb")
+
+        # Get candidates for current category
+        self.current_candidates = DatabaseManager.get_candidates_by_category(self.categories[self.current_category])
+
+        if not self.current_candidates:
+            # No candidates available
+            no_candidate_label = CTkLabel(self.candidate_card,
+                                          text="No candidates available\nfor this category",
+                                          font=CTkFont(family="Segoe UI", size=18),
+                                          text_color="#64748b")
+            no_candidate_label.pack(expand=True)
+
+            # Skip to next category after delay
+            self.root.after(2000, self.next_category)
+            return
+
+        self.display_current_candidate()
+
+    def display_current_candidate(self):
+        """Display the current candidate"""
+        if self.current_candidate_index >= len(self.current_candidates):
+            self.next_category()
+            return
+
+        candidate_data = self.current_candidates[self.current_candidate_index]
+        candidate_id, name, image_path, votes = candidate_data
+
+        def vote_action():
+            # Update vote count
+            new_votes = votes + 1
+            DatabaseManager.update_candidate_votes(candidate_id, new_votes)
+            print(f"{name} votes: {new_votes}")
+            self.play_success_sound()
+            self.root.after(500, self.next_category)
+
+        self.create_candidate_display(name, image_path, vote_action)
+
+    def create_candidate_display(self, name, image_file, vote_action):
+        # Photo container with border
+        photo_container = CTkFrame(self.candidate_card,
+                                   width=300, height=350,
+                                   corner_radius=15,
+                                   fg_color="#f8fafc",
+                                   border_width=1,
+                                   border_color="#e2e8f0")
+        photo_container.pack(pady=(30, 20))
+        photo_container.pack_propagate(False)
+
+        try:
+            if image_file:
+                image = PhotoImage(file=image_file)
+                candidate_img = Label(photo_container, image=image, bg='#f8fafc')
+                candidate_img.image = image  # Keep a reference
+                candidate_img.place(relx=0.5, rely=0.5, anchor="center")
+            else:
+                raise Exception("No image path")
+        except:
+            # Fallback with professional placeholder
+            placeholder = CTkLabel(photo_container,
+                                   text="📷\nPhoto",
+                                   font=CTkFont(family="Segoe UI", size=24),
+                                   text_color="#94a3b8")
+            placeholder.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Candidate name with better typography
+        name_label = CTkLabel(self.candidate_card,
+                              text=name.title(),
+                              font=CTkFont(family="Segoe UI", size=22, weight="bold"),
+                              text_color="#1e293b")
+        name_label.pack(pady=(0, 10))
+
+        # Position indicator
+        position_label = CTkLabel(self.candidate_card,
+                                  text=f"Candidate for {self.categories[self.current_category]}",
+                                  font=CTkFont(family="Segoe UI", size=12),
+                                  text_color="#64748b")
+        position_label.pack(pady=(0, 30))
+
+        # Vote button with professional styling
+        vote_button = CTkButton(self.candidate_card,
+                                text="CAST VOTE",
+                                command=vote_action,
+                                font=CTkFont(family="Segoe UI", size=18, weight="bold"),
+                                fg_color="#1e40af",
+                                hover_color="#1e3a8a",
+                                corner_radius=12,
+                                width=200,
+                                height=50)
+        vote_button.pack(pady=10)
+
+        # Add subtle instruction
+        instruction = CTkLabel(self.candidate_card,
+                               text="Click to vote for this candidate",
+                               font=CTkFont(family="Segoe UI", size=11),
+                               text_color="#94a3b8")
+        instruction.pack(pady=(5, 0))
+
+    def run(self):
+        self.root.mainloop()
+
+
+# Run the application
+if __name__ == "__main__":
+    app = ElectionApp()
+    app.run()
