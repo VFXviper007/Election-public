@@ -6,6 +6,8 @@ import mysql.connector
 from datetime import datetime
 import hashlib
 import tkinter.messagebox as messagebox
+from PIL import Image
+from tkinter import filedialog
 
 # Set CustomTkinter appearance
 set_appearance_mode("light")
@@ -124,6 +126,22 @@ class DatabaseManager:
 
 class AdminPanel:
     """Admin interface for managing candidates and voting"""
+
+    def browse_image_file(self, entry_widget):
+        """Browse and select image file"""
+        file_path = filedialog.askopenfilename(
+            title="Select Candidate Image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.tiff"),
+                ("PNG files", "*.png"),
+                ("JPEG files", "*.jpg *.jpeg"),
+                ("All files", "*.*")
+            ],
+            initialdir="C:/Users/Asus/Pictures"  # Set your default directory
+        )
+        if file_path:
+            entry_widget.delete(0, 'end')
+            entry_widget.insert(0, file_path)
 
     def __init__(self, parent_app):
         self.parent_app = parent_app
@@ -312,10 +330,21 @@ class AdminPanel:
                                       variable=category_var, width=250)
         category_menu.pack(pady=5)
 
-        # Image path input
-        CTkLabel(add_window, text="Image Path (optional):").pack(pady=(15, 5))
-        image_entry = CTkEntry(add_window, width=250, height=35)
-        image_entry.pack(pady=5)
+        # Image path input with browse button
+        CTkLabel(add_window, text="Select Image (optional):").pack(pady=(15, 5))
+
+        image_frame = CTkFrame(add_window, fg_color="transparent")
+        image_frame.pack(pady=5)
+
+        image_entry = CTkEntry(image_frame, width=180, height=35,
+                               placeholder_text="No image selected")
+        image_entry.pack(side="left", padx=(0, 5))
+
+        browse_btn = CTkButton(image_frame, text="Browse",
+                               command=lambda: self.browse_image_file(image_entry),
+                               width=60, height=35,
+                               fg_color="#059669", hover_color="#047857")
+        browse_btn.pack(side="left")
 
         def add_candidate():
             name = name_entry.get().strip()
@@ -520,7 +549,7 @@ class ElectionApp:
 
         # Create candidate card with professional styling
         self.candidate_card = CTkFrame(self.voting_container,
-                                       width=400, height=600,
+                                       width=500, height=650,  # Made wider and taller
                                        corner_radius=20,
                                        fg_color=("#ffffff", "#f8fafc"),
                                        border_width=2, border_color="#e2e8f0")
@@ -564,6 +593,72 @@ class ElectionApp:
         fade = np.linspace(1, 0, len(success_sound))
         success_sound *= fade
         sd.play(success_sound, samplerate=fs)
+
+    def create_candidate_item(self, parent_frame, name, image_file, vote_action):
+        """Create a candidate item within a frame"""
+
+        # Create horizontal layout
+        content_frame = CTkFrame(parent_frame, fg_color="transparent")
+        content_frame.pack(fill="x", padx=15, pady=15)
+
+        # Left side - Image
+        image_frame = CTkFrame(content_frame, width=100, height=120,
+                               corner_radius=10, fg_color="#f8fafc")
+        image_frame.pack(side="left", padx=(0, 15))
+        image_frame.pack_propagate(False)
+
+        # Load image
+        try:
+            if image_file and image_file.strip():
+                actual_image_path = self.find_image_file(image_file)
+                if actual_image_path:
+                    pil_image = Image.open(actual_image_path)
+                    pil_image = pil_image.resize((80, 100), Image.Resampling.LANCZOS)
+                    image = CTkImage(light_image=pil_image, size=(80, 100))
+                    candidate_img = CTkLabel(image_frame, image=image, text='')
+                    candidate_img.pack(expand=True, padx=10, pady=10)
+                else:
+                    raise Exception("Image not found")
+            else:
+                raise Exception("No image path")
+        except Exception as e:
+            print(f"Error loading image '{image_file}': {e}")
+            placeholder = CTkLabel(image_frame, text="📷",
+                                   font=CTkFont(size=20), text_color="#94a3b8")
+            placeholder.pack(expand=True)
+
+        # Right side - Name and Vote button
+        info_frame = CTkFrame(content_frame, fg_color="transparent")
+        info_frame.pack(side="left", fill="x", expand=True)
+
+        # Candidate name
+        name_label = CTkLabel(info_frame, text=name.title(),
+                              font=CTkFont(family="Segoe UI", size=18, weight="bold"),
+                              text_color="#1e293b")
+        name_label.pack(anchor="w", pady=(10, 5))
+
+        # Vote button
+        vote_button = CTkButton(info_frame, text="VOTE",
+                                command=vote_action,
+                                font=CTkFont(family="Segoe UI", size=14, weight="bold"),
+                                fg_color="#1e40af", hover_color="#1e3a8a",
+                                corner_radius=8, width=120, height=35)
+        vote_button.pack(anchor="w", pady=(5, 10))
+
+    def find_image_file(self, base_path):
+        """Find image file with common extensions"""
+        import os
+        extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff']
+
+        if os.path.exists(base_path):
+            return base_path
+
+        for ext in extensions:
+            full_path = base_path + ext
+            if os.path.exists(full_path):
+                return full_path
+
+        return None
 
     def update_status(self, message, color="#059669"):
         self.status_right.configure(text=f"Status: {message}", text_color=color)
@@ -619,7 +714,7 @@ class ElectionApp:
         self.total_voters += 1
 
     def restart_voting(self):
-        # Clear all completion message elements
+        # Clear all completion message elements and any grid containers
         for widget in self.voting_container.winfo_children():
             if widget != self.candidate_card:
                 widget.destroy()
@@ -649,6 +744,10 @@ class ElectionApp:
         # Get candidates for current category
         self.current_candidates = DatabaseManager.get_candidates_by_category(self.categories[self.current_category])
 
+        self.display_all_candidates()  # Changed from display_current_candidate()
+
+    def display_all_candidates(self):
+        """Display all candidates for the current category in individual tiles"""
         if not self.current_candidates:
             # No candidates available
             no_candidate_label = CTkLabel(self.candidate_card,
@@ -656,32 +755,114 @@ class ElectionApp:
                                           font=CTkFont(family="Segoe UI", size=18),
                                           text_color="#64748b")
             no_candidate_label.pack(expand=True)
-
             # Skip to next category after delay
             self.root.after(2000, self.next_category)
             return
 
-        self.display_current_candidate()
+        # Hide the single candidate card
+        self.candidate_card.place_forget()
 
-    def display_current_candidate(self):
-        """Display the current candidate"""
-        if self.current_candidate_index >= len(self.current_candidates):
-            self.next_category()
-            return
+        # Create grid container for candidate tiles
+        grid_container = CTkFrame(self.voting_container, fg_color="transparent")
+        grid_container.pack(fill="both", expand=True, pady=20)
 
-        candidate_data = self.current_candidates[self.current_candidate_index]
-        candidate_id, name, image_path, votes = candidate_data
+        # Calculate grid layout based on number of candidates
+        num_candidates = len(self.current_candidates)
+        if num_candidates <= 5:
+            cols = 5
+            rows = 1
+        elif num_candidates <= 10:
+            cols = 5
+            rows = 2
 
-        def vote_action():
-            # Update vote count
-            new_votes = votes + 1
-            DatabaseManager.update_candidate_votes(candidate_id, new_votes)
-            print(f"{name} votes: {new_votes}")
-            self.play_success_sound()
-            self.root.after(500, self.next_category)
 
-        self.create_candidate_display(name, image_path, vote_action)
+        # Create candidate tiles
+        for i, candidate_data in enumerate(self.current_candidates):
+            candidate_id, name, image_path, votes = candidate_data
 
+            # Calculate position
+            row = i // cols
+            col = i % cols
+
+            # Create candidate tile
+            tile_frame = CTkFrame(grid_container,
+                                  width=350, height=450,
+                                  corner_radius=20,
+                                  fg_color=("#ffffff", "#f8fafc"),
+                                  border_width=2, border_color="#e2e8f0")
+
+            # Position the tile in grid
+            tile_frame.grid(row=row, column=col, padx=20, pady=15, sticky="nsew")
+            tile_frame.grid_propagate(False)
+
+            # Configure grid weights for centering
+            grid_container.grid_rowconfigure(row, weight=1)
+            grid_container.grid_columnconfigure(col, weight=1)
+
+            # Photo container
+            photo_container = CTkFrame(tile_frame,
+                                       width=280, height=300,
+                                       corner_radius=15,
+                                       fg_color="#f8fafc",
+                                       border_width=1,
+                                       border_color="#e2e8f0")
+            photo_container.pack(pady=(20, 15))
+            photo_container.pack_propagate(False)
+
+            # Load and display image
+            try:
+                if image_path and image_path.strip():
+                    actual_image_path = self.find_image_file(image_path)
+                    if actual_image_path:
+                        pil_image = Image.open(actual_image_path)
+                        pil_image = pil_image.resize((250, 280), Image.Resampling.LANCZOS)
+                        image = CTkImage(light_image=pil_image, size=(250, 280))
+                        candidate_img = CTkLabel(photo_container, image=image, text='')
+                        candidate_img.pack(expand=True, padx=15, pady=10)
+                    else:
+                        raise Exception("Image not found")
+                else:
+                    raise Exception("No image path")
+            except Exception as e:
+                print(f"Error loading image '{image_path}': {e}")
+                placeholder = CTkLabel(photo_container,
+                                       text="📷\nPhoto",
+                                       font=CTkFont(family="Segoe UI", size=24),
+                                       text_color="#94a3b8")
+                placeholder.pack(expand=True)
+
+            # Candidate name
+            name_label = CTkLabel(tile_frame,
+                                  text=name.title(),
+                                  font=CTkFont(family="Segoe UI", size=18, weight="bold"),
+                                  text_color="#1e293b")
+            name_label.pack(pady=(0, 10))
+
+            # Vote button
+            def create_vote_action(cid, cname, cvotes):
+                def vote_action():
+                    # Update vote count
+                    new_votes = cvotes + 1
+                    DatabaseManager.update_candidate_votes(cid, new_votes)
+                    print(f"{cname} votes: {new_votes}")
+                    self.play_success_sound()
+                    # Clear the grid and show completion
+                    grid_container.destroy()
+                    self.candidate_card.place(relx=0.5, rely=0.5, anchor="center")  # Restore card position
+                    self.root.after(500, self.next_category)
+
+                return vote_action
+
+            vote_button = CTkButton(tile_frame,
+                                    text="VOTE",
+                                    command=create_vote_action(candidate_id, name, votes),
+                                    font=CTkFont(family="Segoe UI", size=16, weight="bold"),
+                                    fg_color="#1e40af",
+                                    hover_color="#1e3a8a",
+                                    corner_radius=12,
+                                    width=150,
+                                    height=40)
+            vote_button.pack(pady=(0, 20))
     def create_candidate_display(self, name, image_file, vote_action):
         # Photo container with border
         photo_container = CTkFrame(self.candidate_card,
@@ -692,16 +873,18 @@ class ElectionApp:
                                    border_color="#e2e8f0")
         photo_container.pack(pady=(30, 20))
         photo_container.pack_propagate(False)
-
         try:
-            if image_file:
-                image = PhotoImage(file=image_file)
-                candidate_img = Label(photo_container, image=image, bg='#f8fafc')
-                candidate_img.image = image  # Keep a reference
-                candidate_img.place(relx=0.5, rely=0.5, anchor="center")
+            if image_file and image_file.strip():  # Check if image_file exists and is not empty
+                pil_image = Image.open(image_file)
+                # Resize image to fit the container properly
+                pil_image = pil_image.resize((250, 300), Image.Resampling.LANCZOS)
+                image = CTkImage(light_image=pil_image, size=(250, 300))
+                candidate_img = CTkLabel(photo_container, image=image, text='')
+                candidate_img.pack(expand=True, fill="both", padx=10, pady=10)
             else:
                 raise Exception("No image path")
-        except:
+        except Exception as e:
+            print(f"Error loading image '{image_file}': {e}")  # Debug print
             # Fallback with professional placeholder
             placeholder = CTkLabel(photo_container,
                                    text="📷\nPhoto",
