@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""
+Client Synchronization Script
+Runs on each client PC to sync local votes to central server
+"""
+
+import mysql.connector
+import requests
+import json
+import hashlib
+import time
+import schedule
+import logging
+from datetime import datetime
+import socket
+import uuid
+import hmac
+from typing import Dict, List, Optional
+
+# Configuration
+CLIENT_CONFIG = {
+    'pc_id': 'PC001',  # Unique identifier for this PC
+    'server_url': 'http://192.168.1.100:5000',  # Central server URL
+    'sync_interval': 30,  # Sync every 30 seconds
+    'api_key': 'your-secret-api-key-here',  # Shared secret for authentication
+    'local_db': {
+        'host': 'localhost',
+        'user': 'root',
+        'password': 'root',
+        'database': 'election'
+    }
+}
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'sync_client_{CLIENT_CONFIG["pc_id"]}.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class VoteSynchronizer:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.pc_id = config['pc_id']
+        self.server_url = config['server_url']
+        self.api_key = config['api_key']
+        self.session = requests.Session()
+        
+        # Generate unique machine fingerprint
+        self.machine_id = self._generate_machine_id()
+        
+        # Track last sync timestamp
+        self.last_sync_file = f'last_sync_{self.pc_id}.txt'
+        
+    def _generate_machine_id(self) -> str:
+        """Generate unique machine identifier"""
+        try:
+            mac = uuid.getnode()
+            hostname = socket.gethostname()
+            return hashlib.sha256(f"{mac}_{hostname}_{self.pc_id}".encode()).hexdigest()[:16]
+        except Exception:
+            return hashlib.sha256(f"fallback_{self.pc_id}".encode()).hexdigest()[:16]
+    
+    def _get_last_sync_timestamp(self) -> Optional[str]:
+        """Get timestamp of last successful sync"""
+        try:
+            with open(self.last_sync_file, 'r') as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return None
+    
+    def _update_last_sync_timestamp(self, timestamp: str):
+        """Update last sync timestamp"""
+        with open(self.last_sync_file, 'w') as f:
+            f.write(timestamp)
+    
+    def _create_signature(self, data: str) -> str:
+        """Create HMAC signature for data integrity"""
+        return hmac.new(
+            self.api_key.encode(),
+            data.encode(),
+            hashlib.sha256
+        ).hexdigest()
+    
+    def _get_local_votes(self) -> List[Dict]:
+        """Retrieve votes from local database"""
+        try:
+            conn = mysql.connector.connect(**self.config['local_db'])
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get all votes with candidate information
+            query = """
+            SELECT 
+                c.id as candidate_id,
+                c.name as candidate_name,
+                c.category,
+                c.votes,
+                c.created_at,
+                COALESCE(c.updated_at, c.created_at) as last_modified
+            FROM candidates c 
+            WHERE c.active = TRUE AND c.votes > 0
+            """
+            
+            cursor.execute(query)
+            votes = cursor.fetchall()
+            
+            # Convert datetime objects to strings
+            for vote in votes:
+                for key, value in vote.items():
+                    if isinstance(value, datetime):
+                        vote[key] = value.isoformat()
+            
+            cursor.close()
+            conn.close()
+            
+            logger.info(f"Retrieved {len(votes)} vote records from local database")
+            return votes
+            
+        except Exception as e:
+            logger.error(f"Error retrieving local votes: {e}")
+            return []
+    
+    def _get_vote_transactions(self) -> List[Dict]:
+        """Get individual vote transactions (if tracked)"""
+        try:
+            conn = mysql.connector.connect(**self.config['local_db'])
+            cursor = conn.cursor(dictionary=True)
+            
+            # Check if vote_transactions table exists
+            cursor.execute("""
+                SELECT COUNT(*) as count 
+                FROM information_schema.tables 
+                WHERE table_schema = %s AND table_name = 'vote_transactions'
+            """, (self.config['local_db']['database'],))
+            
+            if cursor.fetchone()['count'] == 0:
+                logger.info("Vote transactions table not found, using candidate votes only")
+                cursor.close()
+                conn.close()
+                return []
+            
+            # Get new transactions since last sync
+            last_sync = self._get_last_sync_timestamp()
+            if last_sync:
+                query = """
+                SELECT * FROM vote_transactions 
+                WHERE created_at > %s AND synced = FALSE
+                ORDER BY created_at ASC
+                """
+                cursor.execute(query, (last_sync,))
+            else:
+                query = """
+                SELECT * FROM vote_transactions 
+                WHERE synced = FALSE
+                ORDER BY created_at ASC
+                """
+                cursor.execute(query)
+            
+            transactions = cursor.fetchall()
+            
+            # Convert datetime objects to strings
+            for transaction in transactions:
+                for key, value in transaction.items():
+                    if isinstance(value, datetime):
+                        transaction[key] = value.isoformat()
+            
+            cursor.close()
+            conn.close()
+            
+            return transactions
+            
+        except Exception as e:
+            logger.error(f"Error retrieving vote transactions: {e}")
+            return []
+    
+    def _mark_transactions_synced(self, transaction_ids: List[int]):
+        """Mark transactions as synced in local database"""
+        if not transaction_ids:
+            return
+            
+        try:
+            conn = mysql.connector.connect(**self.config['local_db'])
+            cursor = conn.cursor()
+            
+            placeholders = ','.join(['%s'] * len(transaction_ids))
+            query = f"UPDATE vote_transactions SET synced = TRUE WHERE id IN ({placeholders})"
+            cursor.execute(query, transaction_ids)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info(f"Marked {len(transaction_ids)} transactions as synced")
+            
+        except Exception as e:
+            logger.error(f"Error marking transactions as synced: {e}")
+    
+    def sync_votes(self) -> bool:
+        """Synchronize votes with central server"""
+        try:
+            # Get vote data
+            votes_data = self._get_local_votes()
+            transactions_data = self._get_vote_transactions()
+            
+            if not votes_data and not transactions_data:
+                logger.info("No new votes to sync")
+                return True
+            
+            # Prepare sync payload
+            sync_time = datetime.now().isoformat()
+            payload = {
+                'pc_id': self.pc_id,
+                'machine_id': self.machine_id,
+                'sync_timestamp': sync_time,
+                'votes_summary': votes_data,
+                'vote_transactions': transactions_data,
+                'total_votes': sum(vote['votes'] for vote in votes_data)
+            }
+            
+            # Create signature
+            payload_json = json.dumps(payload, sort_keys=True)
+            signature = self._create_signature(payload_json)
+            
+            # Send to server
+            headers = {
+                'Content-Type': 'application/json',
+                'X-API-Key': self.api_key,
+                'X-Signature': signature,
+                'X-PC-ID': self.pc_id
+            }
+            
+            response = self.session.post(
+                f"{self.server_url}/api/sync_votes",
+                json=payload,
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('status') == 'success':
+                    # Mark transactions as synced
+                    if transactions_data:
+                        transaction_ids = [t['id'] for t in transactions_data if 'id' in t]
+                        self._mark_transactions_synced(transaction_ids)
+                    
+                    # Update last sync timestamp
+                    self._update_last_sync_timestamp(sync_time)
+                    
+                    logger.info(f"Successfully synced {len(votes_data)} vote summaries and {len(transactions_data)} transactions")
+                    return True
+                else:
+                    logger.error(f"Server rejected sync: {result.get('message', 'Unknown error')}")
+                    return False
+            else:
+                logger.error(f"Sync failed with status {response.status_code}: {response.text}")
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error during sync: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during sync: {e}")
+            return False
+    
+    def register_client(self) -> bool:
+        """Register this client with the central server"""
+        try:
+            registration_data = {
+                'pc_id': self.pc_id,
+                'machine_id': self.machine_id,
+                'hostname': socket.gethostname(),
+                'registration_time': datetime.now().isoformat()
+            }
+            
+            signature = self._create_signature(json.dumps(registration_data, sort_keys=True))
+            
+            headers = {
+                'Content-Type': 'application/json',
+                'X-API-Key': self.api_key,
+                'X-Signature': signature
+            }
+            
+            response = self.session.post(
+                f"{self.server_url}/api/register_client",
+                json=registration_data,
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                logger.info("Successfully registered with central server")
+                return True
+            else:
+                logger.error(f"Registration failed: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error registering client: {e}")
+            return False
+    
+    def health_check(self) -> bool:
+        """Check connection to central server"""
+        try:
+            response = self.session.get(
+                f"{self.server_url}/api/health",
+                timeout=5
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
+def main():
+    """Main synchronization loop"""
+    synchronizer = VoteSynchronizer(CLIENT_CONFIG)
+    
+    logger.info(f"Starting vote synchronizer for PC: {CLIENT_CONFIG['pc_id']}")
+    
+    # Register client on startup
+    if not synchronizer.register_client():
+        logger.warning("Failed to register with server, but continuing...")
+    
+    # Schedule regular sync
+    schedule.every(CLIENT_CONFIG['sync_interval']).seconds.do(synchronizer.sync_votes)
+    
+    # Initial sync
+    synchronizer.sync_votes()
+    
+    # Main loop
+    while True:
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down synchronizer...")
+            break
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+            time.sleep(5)  # Wait before retrying
+
+if __name__ == "__main__":
+    main()
