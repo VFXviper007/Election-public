@@ -1,38 +1,780 @@
+#!/usr/bin/env python3
+"""
+Central Server Flask Application
+Receives votes from client PCs and manages centralized vote aggregation
+"""
+
 from flask import Flask, request, jsonify
 import mysql.connector
+from mysql.connector import Error
+import json
+import hashlib
+import hmac
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+import threading
+import time
+import schedule
+
+# Configuration
+SERVER_CONFIG = {
+    'api_key': 'your-secret-api-key-here',  # Must match client API key
+    'database': {
+        'host': 'localhost',
+        'user': 'root',
+        'password': 'root',
+        'database': 'election_central'
+    },
+    'aggregation_interval': 300,  # Aggregate every 5 minutes
+    'max_sync_age': 3600,  # Consider syncs older than 1 hour as stale
+}
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('election_server.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-received_data_list = []
-conn = mysql.connector.connect(
-    host="localhost",
-    user="root",
-    passwd="root",
-    database="election"
-)
-cursor = conn.cursor()
+class DatabaseManager:
+    """Manages database operations for the central server"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.initialize_database()
+    
+    def get_connection(self):
+        """Get database connection"""
+        return mysql.connector.connect(**self.config)
+    
+    def initialize_database(self):
+        """Initialize central database schema"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Create registered clients table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS registered_clients (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    pc_id VARCHAR(50) UNIQUE NOT NULL,
+                    machine_id VARCHAR(32) NOT NULL,
+                    hostname VARCHAR(255),
+                    first_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    total_syncs INT DEFAULT 0
+                )
+            """)
+            
+            # Create sync log table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sync_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    pc_id VARCHAR(50) NOT NULL,
+                    sync_timestamp TIMESTAMP NOT NULL,
+                    votes_count INT NOT NULL,
+                    transactions_count INT NOT NULL,
+                    status ENUM('success', 'failed', 'partial') NOT NULL,
+                    error_message TEXT NULL,
+                    data_hash VARCHAR(64) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_pc_sync (pc_id, sync_timestamp),
+                    INDEX idx_status (status),
+                    FOREIGN KEY (pc_id) REFERENCES registered_clients(pc_id)
+                )
+            """)
+            
+            # Create master votes table (aggregated results)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS master_votes (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    candidate_name VARCHAR(255) NOT NULL,
+                    category VARCHAR(100) NOT NULL,
+                    total_votes INT NOT NULL DEFAULT 0,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    contributing_pcs TEXT,  -- JSON array of PC IDs that contributed
+                    UNIQUE KEY unique_candidate_category (candidate_name, category)
+                )
+            """)
+            
+            # Create aggregation log
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS aggregation_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    aggregation_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_candidates INT NOT NULL,
+                    total_votes INT NOT NULL,
+                    participating_pcs INT NOT NULL,
+                    duration_seconds DECIMAL(10,3) NOT NULL,
+                    status ENUM('success', 'failed', 'partial') NOT NULL,
+                    error_message TEXT NULL
+                )
+            """)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info("Central database initialized successfully")
+            
+        except Error as e:
+            logger.error(f"Error initializing database: {e}")
+            raise
+    
+    def create_pc_table(self, pc_id: str):
+        """Create individual table for a PC's votes"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            table_name = f"votes_{pc_id.lower()}"
+            
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    candidate_id INT NOT NULL,
+                    candidate_name VARCHAR(255) NOT NULL,
+                    category VARCHAR(100) NOT NULL,
+                    votes INT NOT NULL DEFAULT 0,
+                    sync_timestamp TIMESTAMP NOT NULL,
+                    original_timestamp TIMESTAMP NOT NULL,
+                    data_hash VARCHAR(64) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY unique_sync_candidate (candidate_id, sync_timestamp),
+                    INDEX idx_category (category),
+                    INDEX idx_sync_time (sync_timestamp)
+                )
+            """)
+            
+            # Create vote transactions table for this PC
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS transactions_{pc_id.lower()} (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    transaction_id VARCHAR(100),
+                    candidate_id INT NOT NULL,
+                    candidate_name VARCHAR(255) NOT NULL,
+                    category VARCHAR(100) NOT NULL,
+                    vote_timestamp TIMESTAMP NOT NULL,
+                    sync_timestamp TIMESTAMP NOT NULL,
+                    voter_session VARCHAR(100),
+                    data_hash VARCHAR(64) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_transaction (transaction_id),
+                    INDEX idx_candidate (candidate_id),
+                    INDEX idx_vote_time (vote_timestamp)
+                )
+            """)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info(f"Created tables for PC: {pc_id}")
+            
+        except Error as e:
+            logger.error(f"Error creating PC table for {pc_id}: {e}")
+            raise
+    
+    def register_client(self, pc_id: str, machine_id: str, hostname: str = None) -> bool:
+        """Register a new client PC"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Insert or update client registration
+            cursor.execute("""
+                INSERT INTO registered_clients (pc_id, machine_id, hostname)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                machine_id = VALUES(machine_id),
+                hostname = VALUES(hostname),
+                last_seen = CURRENT_TIMESTAMP,
+                is_active = TRUE
+            """, (pc_id, machine_id, hostname))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            # Create PC-specific tables
+            self.create_pc_table(pc_id)
+            
+            return True
+            
+        except Error as e:
+            logger.error(f"Error registering client {pc_id}: {e}")
+            return False
+    
+    def store_votes(self, pc_id: str, votes_data: List[Dict], sync_timestamp: str, data_hash: str) -> bool:
+        """Store votes from a specific PC"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            table_name = f"votes_{pc_id.lower()}"
+            
+            for vote in votes_data:
+                cursor.execute(f"""
+                    INSERT INTO {table_name} 
+                    (candidate_id, candidate_name, category, votes, sync_timestamp, original_timestamp, data_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                    votes = VALUES(votes),
+                    data_hash = VALUES(data_hash)
+                """, (
+                    vote['candidate_id'],
+                    vote['candidate_name'],
+                    vote['category'],
+                    vote['votes'],
+                    sync_timestamp,
+                    vote.get('created_at', sync_timestamp),
+                    data_hash
+                ))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            return True
+            
+        except Error as e:
+            logger.error(f"Error storing votes for {pc_id}: {e}")
+            return False
+    
+    def store_transactions(self, pc_id: str, transactions: List[Dict], sync_timestamp: str, data_hash: str) -> bool:
+        """Store vote transactions from a specific PC"""
+        if not transactions:
+            return True
+            
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            table_name = f"transactions_{pc_id.lower()}"
+            
+            for transaction in transactions:
+                cursor.execute(f"""
+                    INSERT INTO {table_name}
+                    (transaction_id, candidate_id, candidate_name, category, 
+                     vote_timestamp, sync_timestamp, voter_session, data_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                    sync_timestamp = VALUES(sync_timestamp),
+                    data_hash = VALUES(data_hash)
+                """, (
+                    transaction.get('id', f"{pc_id}_{transaction.get('candidate_id')}_{transaction.get('created_at')}"),
+                    transaction['candidate_id'],
+                    transaction['candidate_name'],
+                    transaction['category'],
+                    transaction.get('created_at', sync_timestamp),
+                    sync_timestamp,
+                    transaction.get('voter_session', ''),
+                    data_hash
+                ))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            return True
+            
+        except Error as e:
+            logger.error(f"Error storing transactions for {pc_id}: {e}")
+            return False
+    
+    def log_sync(self, pc_id: str, sync_timestamp: str, votes_count: int, 
+                 transactions_count: int, status: str, data_hash: str, error_message: str = None):
+        """Log synchronization attempt"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO sync_log 
+                (pc_id, sync_timestamp, votes_count, transactions_count, status, error_message, data_hash)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (pc_id, sync_timestamp, votes_count, transactions_count, status, error_message, data_hash))
+            
+            # Update client's total sync count
+            cursor.execute("""
+                UPDATE registered_clients 
+                SET total_syncs = total_syncs + 1, last_seen = CURRENT_TIMESTAMP
+                WHERE pc_id = %s
+            """, (pc_id,))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+        except Error as e:
+            logger.error(f"Error logging sync for {pc_id}: {e}")
+    
+    def aggregate_votes(self) -> Dict:
+        """Aggregate votes from all PC tables into master table"""
+        start_time = time.time()
+        
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get all registered PCs
+            cursor.execute("SELECT pc_id FROM registered_clients WHERE is_active = TRUE")
+            active_pcs = [row['pc_id'] for row in cursor.fetchall()]
+            
+            if not active_pcs:
+                logger.warning("No active PCs found for aggregation")
+                return {'status': 'failed', 'message': 'No active PCs'}
+            
+            # Clear existing master votes
+            cursor.execute("DELETE FROM master_votes")
+            
+            vote_aggregates = {}
+            
+            # Aggregate votes from each PC table
+            for pc_id in active_pcs:
+                table_name = f"votes_{pc_id.lower()}"
+                
+                try:
+                    cursor.execute(f"""
+                        SELECT candidate_name, category, MAX(votes) as votes 
+                        FROM {table_name} 
+                        GROUP BY candidate_name, category
+                        HAVING votes > 0
+                    """)
+                    
+                    pc_votes = cursor.fetchall()
+                    
+                    for vote in pc_votes:
+                        key = (vote['candidate_name'], vote['category'])
+                        if key not in vote_aggregates:
+                            vote_aggregates[key] = {
+                                'votes': 0,
+                                'contributing_pcs': []
+                            }
+                        
+                        vote_aggregates[key]['votes'] += vote['votes']
+                        vote_aggregates[key]['contributing_pcs'].append(pc_id)
+                
+                except Error as e:
+                    logger.error(f"Error reading from {table_name}: {e}")
+                    continue
+            
+            # Insert aggregated results into master table
+            total_votes = 0
+            for (candidate_name, category), data in vote_aggregates.items():
+                cursor.execute("""
+                    INSERT INTO master_votes 
+                    (candidate_name, category, total_votes, contributing_pcs)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    candidate_name,
+                    category,
+                    data['votes'],
+                    json.dumps(data['contributing_pcs'])
+                ))
+                total_votes += data['votes']
+            
+            # Log aggregation
+            duration = time.time() - start_time
+            cursor.execute("""
+                INSERT INTO aggregation_log 
+                (total_candidates, total_votes, participating_pcs, duration_seconds, status)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (len(vote_aggregates), total_votes, len(active_pcs), duration, 'success'))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info(f"Vote aggregation completed: {len(vote_aggregates)} candidates, {total_votes} total votes from {len(active_pcs)} PCs")
+            
+            return {
+                'status': 'success',
+                'candidates': len(vote_aggregates),
+                'total_votes': total_votes,
+                'participating_pcs': len(active_pcs),
+                'duration': duration
+            }
+            
+        except Error as e:
+            duration = time.time() - start_time
+            logger.error(f"Error during vote aggregation: {e}")
+            
+            # Log failed aggregation
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO aggregation_log 
+                    (total_candidates, total_votes, participating_pcs, duration_seconds, status, error_message)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (0, 0, 0, duration, 'failed', str(e)))
+                conn.commit()
+                cursor.close()
+                conn.close()
+            except:
+                pass
+            
+            return {'status': 'failed', 'message': str(e)}
+    
+    def get_master_results(self, category: str = None) -> List[Dict]:
+        """Get aggregated vote results"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor(dictionary=True)
+            
+            if category:
+                cursor.execute("""
+                    SELECT candidate_name, category, total_votes, contributing_pcs, last_updated
+                    FROM master_votes 
+                    WHERE category = %s
+                    ORDER BY total_votes DESC
+                """, (category,))
+            else:
+                cursor.execute("""
+                    SELECT candidate_name, category, total_votes, contributing_pcs, last_updated
+                    FROM master_votes 
+                    ORDER BY category, total_votes DESC
+                """)
+            
+            results = cursor.fetchall()
+            
+            # Parse contributing_pcs JSON strings
+            for result in results:
+                if result['contributing_pcs']:
+                    result['contributing_pcs'] = json.loads(result['contributing_pcs'])
+                else:
+                    result['contributing_pcs'] = []
+                
+                # Convert datetime to string
+                if result['last_updated']:
+                    result['last_updated'] = result['last_updated'].isoformat()
+            
+            cursor.close()
+            conn.close()
+            
+            return results
+            
+        except Error as e:
+            logger.error(f"Error getting master results: {e}")
+            return []
+    
+    def get_system_status(self) -> Dict:
+        """Get system status and statistics"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get client statistics
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_clients,
+                    SUM(CASE WHEN is_active = TRUE THEN 1 ELSE 0 END) as active_clients,
+                    SUM(total_syncs) as total_syncs,
+                    MAX(last_seen) as last_activity
+                FROM registered_clients
+            """)
+            client_stats = cursor.fetchone()
+            
+            # Get vote statistics
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_candidates,
+                    SUM(total_votes) as total_votes,
+                    MAX(last_updated) as last_updated
+                FROM master_votes
+            """)
+            vote_stats = cursor.fetchone()
+            
+            # Get recent sync activity
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_syncs,
+                    COUNT(CASE WHEN status = 'success' THEN 1 END) as successful_syncs,
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_syncs,
+                    MAX(created_at) as last_sync
+                FROM sync_log 
+                WHERE created_at > NOW() - INTERVAL 1 HOUR
+            """)
+            sync_stats = cursor.fetchone()
+            
+            # Get recent aggregation info
+            cursor.execute("""
+                SELECT 
+                    aggregation_timestamp,
+                    total_candidates,
+                    total_votes,
+                    participating_pcs,
+                    duration_seconds,
+                    status
+                FROM aggregation_log 
+                ORDER BY aggregation_timestamp DESC 
+                LIMIT 1
+            """)
+            last_aggregation = cursor.fetchone()
+            
+            cursor.close()
+            conn.close()
+            
+            # Convert datetime objects to strings
+            for stats in [client_stats, vote_stats, sync_stats]:
+                if stats:
+                    for key, value in stats.items():
+                        if isinstance(value, datetime):
+                            stats[key] = value.isoformat()
+            
+            if last_aggregation and last_aggregation['aggregation_timestamp']:
+                last_aggregation['aggregation_timestamp'] = last_aggregation['aggregation_timestamp'].isoformat()
+            
+            return {
+                'client_stats': client_stats,
+                'vote_stats': vote_stats,
+                'sync_stats': sync_stats,
+                'last_aggregation': last_aggregation,
+                'server_time': datetime.now().isoformat()
+            }
+            
+        except Error as e:
+            logger.error(f"Error getting system status: {e}")
+            return {'error': str(e)}
 
-@app.route('/receive_data', methods=['POST'])
-def receive_data():
+# Initialize database manager
+db_manager = DatabaseManager(SERVER_CONFIG['database'])
+
+def verify_signature(data: str, signature: str, api_key: str) -> bool:
+    """Verify HMAC signature"""
+    expected_signature = hmac.new(
+        api_key.encode(),
+        data.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected_signature)
+
+def create_data_hash(data: Dict) -> str:
+    """Create hash of data for integrity checking"""
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+@app.route('/api/register_client', methods=['POST'])
+def register_client():
+    """Register a new client PC"""
     try:
-        # Receive and store the data
+        # Verify API key
+        api_key = request.headers.get('X-API-Key')
+        if api_key != SERVER_CONFIG['api_key']:
+            return jsonify({'status': 'error', 'message': 'Invalid API key'}), 401
+        
+        # Verify signature
+        signature = request.headers.get('X-Signature')
+        data_str = json.dumps(request.json, sort_keys=True)
+        if not verify_signature(data_str, signature, SERVER_CONFIG['api_key']):
+            return jsonify({'status': 'error', 'message': 'Invalid signature'}), 401
+        
         data = request.json
-        print(data)
-        sql="UPDATE test SET HB1=%s,HG1=%s,AB1=%s,AG1=%s where PC='PC1votes'"
-        values=(data['HB1'],data['HG1'],data['AB1'],data['AG1'])
-        cursor.execute(sql,values)
-        conn.commit()
-        return jsonify({"status": "success", "message": "Data received and stored"}), 200
-
+        pc_id = data.get('pc_id')
+        machine_id = data.get('machine_id')
+        hostname = data.get('hostname')
+        
+        if not pc_id or not machine_id:
+            return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
+        
+        # Register client
+        if db_manager.register_client(pc_id, machine_id, hostname):
+            logger.info(f"Client registered: {pc_id} ({hostname})")
+            return jsonify({
+                'status': 'success',
+                'message': 'Client registered successfully',
+                'pc_id': pc_id
+            })
+        else:
+            return jsonify({'status': 'error', 'message': 'Registration failed'}), 500
+    
     except Exception as e:
-        print("Error:", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.error(f"Error in register_client: {e}")
+        return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
+@app.route('/api/sync_votes', methods=['POST'])
+def sync_votes():
+    """Receive and store votes from client PC"""
+    try:
+        # Verify API key
+        api_key = request.headers.get('X-API-Key')
+        if api_key != SERVER_CONFIG['api_key']:
+            return jsonify({'status': 'error', 'message': 'Invalid API key'}), 401
+        
+        # Verify signature
+        signature = request.headers.get('X-Signature')
+        data_str = json.dumps(request.json, sort_keys=True)
+        if not verify_signature(data_str, signature, SERVER_CONFIG['api_key']):
+            return jsonify({'status': 'error', 'message': 'Invalid signature'}), 401
+        
+        data = request.json
+        pc_id = data.get('pc_id')
+        machine_id = data.get('machine_id')
+        sync_timestamp = data.get('sync_timestamp')
+        votes_data = data.get('votes_summary', [])
+        transactions_data = data.get('vote_transactions', [])
+        
+        if not pc_id or not machine_id or not sync_timestamp:
+            return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
+        
+        # Create data hash for integrity
+        data_hash = create_data_hash(data)
+        
+        # Store votes and transactions
+        votes_success = db_manager.store_votes(pc_id, votes_data, sync_timestamp, data_hash)
+        transactions_success = db_manager.store_transactions(pc_id, transactions_data, sync_timestamp, data_hash)
+        
+        # Determine sync status
+        if votes_success and transactions_success:
+            status = 'success'
+            error_message = None
+        elif votes_success or transactions_success:
+            status = 'partial'
+            error_message = 'Some data failed to sync'
+        else:
+            status = 'failed'
+            error_message = 'All data failed to sync'
+        
+        # Log the sync attempt
+        db_manager.log_sync(
+            pc_id, sync_timestamp, len(votes_data), 
+            len(transactions_data), status, data_hash, error_message
+        )
+        
+        if status == 'success':
+            logger.info(f"Successful sync from {pc_id}: {len(votes_data)} votes, {len(transactions_data)} transactions")
+            return jsonify({
+                'status': 'success',
+                'message': 'Data synchronized successfully',
+                'votes_processed': len(votes_data),
+                'transactions_processed': len(transactions_data),
+                'data_hash': data_hash
+            })
+        else:
+            logger.warning(f"Partial/failed sync from {pc_id}: {status} - {error_message}")
+            return jsonify({
+                'status': status,
+                'message': error_message,
+                'votes_processed': len(votes_data) if votes_success else 0,
+                'transactions_processed': len(transactions_data) if transactions_success else 0
+            }), 206 if status == 'partial' else 500
+    
+    except Exception as e:
+        logger.error(f"Error in sync_votes: {e}")
+        return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
+@app.route('/api/results', methods=['GET'])
+def get_results():
+    """Get aggregated election results"""
+    try:
+        category = request.args.get('category')
+        results = db_manager.get_master_results(category)
+        
+        return jsonify({
+            'status': 'success',
+            'results': results,
+            'total_candidates': len(results),
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    except Exception as e:
+        logger.error(f"Error getting results: {e}")
+        return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+@app.route('/api/status', methods=['GET'])
+def system_status():
+    """Get system status and statistics"""
+    try:
+        status_data = db_manager.get_system_status()
+        return jsonify({
+            'status': 'success',
+            'data': status_data
+        })
+    
+    except Exception as e:
+        logger.error(f"Error getting system status: {e}")
+        return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
+@app.route('/api/aggregate', methods=['POST'])
+def trigger_aggregation():
+    """Manually trigger vote aggregation"""
+    try:
+        # Verify API key for admin operations
+        api_key = request.headers.get('X-API-Key')
+        if api_key != SERVER_CONFIG['api_key']:
+            return jsonify({'status': 'error', 'message': 'Invalid API key'}), 401
+        
+        result = db_manager.aggregate_votes()
+        
+        if result['status'] == 'success':
+            return jsonify({
+                'status': 'success',
+                'message': 'Vote aggregation completed',
+                'data': result
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': result.get('message', 'Aggregation failed')
+            }), 500
+    
+    except Exception as e:
+        logger.error(f"Error in manual aggregation: {e}")
+        return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
 
+def run_scheduled_aggregation():
+    """Run scheduled vote aggregation"""
+    logger.info("Running scheduled vote aggregation...")
+    try:
+        result = db_manager.aggregate_votes()
+        if result['status'] == 'success':
+            logger.info("Scheduled aggregation completed successfully")
+        else:
+            logger.error(f"Scheduled aggregation failed: {result.get('message')}")
+    except Exception as e:
+        logger.error(f"Error in scheduled aggregation: {e}")
 
+def start_scheduler():
+    """Start the background scheduler for periodic tasks"""
+    def scheduler_thread():
+        # Schedule vote aggregation
+        schedule.every(SERVER_CONFIG['aggregation_interval']).seconds.do(run_scheduled_aggregation)
+        
+        # Run initial aggregation after startup
+        time.sleep(30)  # Wait 30 seconds after startup
+        run_scheduled_aggregation()
+        
+        while True:
+            schedule.run_pending()
+            time.sleep(10)
+    
+    scheduler = threading.Thread(target=scheduler_thread, daemon=True)
+    scheduler.start()
+    logger.info(f"Scheduler started - aggregation every {SERVER_CONFIG['aggregation_interval']} seconds")
 
+if __name__ == '__main__':
+    logger.info("Starting Central Election Server...")
+    
+    # Start background scheduler
+    start_scheduler()
+    
+    # Start Flask application
+    app.run(
+        host='0.0.0.0',
+        port=5000,
+        debug=False,
+        threaded=True
+    )
