@@ -1,0 +1,1479 @@
+from tkinter import *
+from customtkinter import *
+import sounddevice as sd
+import numpy as np
+import mysql.connector
+from datetime import datetime
+import hashlib
+import tkinter.messagebox as messagebox
+from PIL import Image
+from tkinter import filedialog
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import seaborn as sns
+from collections import defaultdict
+import matplotlib.dates as mdates
+
+
+# Set CustomTkinter appearance
+set_appearance_mode("light")
+set_default_color_theme("blue")
+
+# Database connection
+conn = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    passwd="root",
+    database="election"
+)
+cursor = conn.cursor()
+
+# Admin password (hashed for security)
+ADMIN_PASSWORD_HASH = hashlib.sha256("admin123".encode()).hexdigest()  # Change this password
+
+# Global variables
+animation_running = False
+duration = 0.3
+fs = 44100
+frequency = 800
+
+
+class DatabaseManager:
+    """Handles all database operations"""
+
+    @staticmethod
+    def initialize_database():
+        """Create necessary tables if they don't exist"""
+        try:
+            # Create candidates table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS candidates (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    category VARCHAR(100) NOT NULL,
+                    image_path VARCHAR(255),
+                    votes INT DEFAULT 0,
+                    active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Create voting_status table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS voting_status (
+                    id INT PRIMARY KEY DEFAULT 1,
+                    is_active BOOLEAN DEFAULT FALSE,
+                    started_at TIMESTAMP NULL,
+                    ended_at TIMESTAMP NULL
+                )
+            """)
+
+            # Insert default voting status if not exists
+            cursor.execute("INSERT IGNORE INTO voting_status (id, is_active) VALUES (1, FALSE)")
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS vote_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    candidate_id INT,
+                    vote_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (candidate_id) REFERENCES candidates(id)
+                )
+            """)
+
+            conn.commit()
+            print("Database initialized successfully")
+        except Exception as e:
+            print(f"Database initialization error: {e}")
+
+    @staticmethod
+    def record_vote_history(candidate_id):
+        """Record a vote in the vote history table"""
+        sql = "INSERT INTO vote_history (candidate_id) VALUES (%s)"
+        cursor.execute(sql, (candidate_id,))
+        conn.commit()
+
+    @staticmethod
+    def get_vote_history_by_category(category):
+        """Get vote history for all candidates in a category"""
+        try:
+            sql = """
+            SELECT c.name, c.id, vh.vote_timestamp 
+            FROM candidates c 
+            LEFT JOIN vote_history vh ON c.id = vh.candidate_id 
+            WHERE c.category = %s AND c.active = TRUE 
+            ORDER BY vh.vote_timestamp
+            """
+            cursor.execute(sql, (category,))
+            result = cursor.fetchall()
+            conn.commit()  # Good practice to commit after database operations
+            return result
+        except Exception as e:
+            print(f"Error getting vote history: {e}")
+            conn.rollback()  # Rollback on error
+            return []
+
+    @staticmethod
+    def get_all_vote_history():
+        """Get complete vote history with candidate details"""
+        sql = """
+            SELECT c.name, c.category, c.id, vh.vote_timestamp
+            FROM candidates c
+            LEFT JOIN vote_history vh ON c.id = vh.candidate_id
+            WHERE c.active = TRUE
+            ORDER BY c.category, vh.vote_timestamp
+        """
+        cursor.execute(sql)
+        return cursor.fetchall()
+
+    @staticmethod
+    def get_candidates_by_category(category):
+        """Get all active candidates for a specific category"""
+        sql = "SELECT id, name, image_path, votes FROM candidates WHERE category = %s AND active = TRUE"
+        cursor.execute(sql, (category,))
+        return cursor.fetchall()
+
+    @staticmethod
+    def add_candidate(name, category, image_path=""):
+        """Add a new candidate"""
+        sql = "INSERT INTO candidates (name, category, image_path) VALUES (%s, %s, %s)"
+        cursor.execute(sql, (name, category, image_path))
+        conn.commit()
+        return cursor.lastrowid
+
+    @staticmethod
+    def update_candidate_votes(candidate_id, votes):
+        """Update candidate vote count"""
+        sql = "UPDATE candidates SET votes = %s WHERE id = %s"
+        cursor.execute(sql, (votes, candidate_id))
+        conn.commit()
+
+    @staticmethod
+    def get_voting_status():
+        """Check if voting is currently active"""
+        cursor.execute("SELECT is_active FROM voting_status WHERE id = 1")
+        result = cursor.fetchone()
+        return result[0] if result else False
+
+    @staticmethod
+    def get_all_candidates_with_votes():
+        """Get all candidates with their vote counts"""
+        sql = """
+           SELECT c.id, c.name, c.category, c.votes, c.created_at 
+           FROM candidates c 
+           WHERE c.active = TRUE 
+           ORDER BY c.category, c.votes DESC
+           """
+        cursor.execute(sql)
+        return cursor.fetchall()
+
+    @staticmethod
+    def get_voting_statistics():
+        """Get comprehensive voting statistics"""
+        stats = {}
+
+        # Total votes per category
+        cursor.execute("""
+               SELECT category, SUM(votes) as total_votes, COUNT(*) as candidate_count
+               FROM candidates 
+               WHERE active = TRUE 
+               GROUP BY category
+           """)
+        stats['category_stats'] = cursor.fetchall()
+
+        # Top candidates overall
+        cursor.execute("""
+               SELECT name, category, votes 
+               FROM candidates 
+               WHERE active = TRUE 
+               ORDER BY votes DESC 
+               LIMIT 10
+           """)
+        stats['top_candidates'] = cursor.fetchall()
+
+        # Total votes cast
+        cursor.execute("SELECT SUM(votes) as total FROM candidates WHERE active = TRUE")
+        result = cursor.fetchone()
+        stats['total_votes'] = result[0] if result[0] else 0
+
+        return stats
+
+    @staticmethod
+    def set_voting_status(status):
+        """Set voting active/inactive"""
+        if status:
+            sql = "UPDATE voting_status SET is_active = TRUE, started_at = NOW() WHERE id = 1"
+        else:
+            sql = "UPDATE voting_status SET is_active = FALSE, ended_at = NOW() WHERE id = 1"
+        cursor.execute(sql)
+        conn.commit()
+
+    @staticmethod
+    def delete_candidate(candidate_id):
+        """Soft delete a candidate"""
+        sql = "UPDATE candidates SET active = FALSE WHERE id = %s"
+        cursor.execute(sql, (candidate_id,))
+        conn.commit()
+
+    @staticmethod
+    def reset_all_votes():
+        """Reset all vote counts to 0"""
+        sql = "UPDATE candidates SET votes = 0"
+        cursor.execute(sql)
+        conn.commit()
+
+
+class AdminPanel:
+    """Admin interface for managing candidates and voting"""
+
+    def create_time_graphs_tab(self, parent):
+        """Create time-based analysis tab (alternative without vote_history table)"""
+        try:
+            # Create a simple analysis frame
+            scroll_frame = CTkScrollableFrame(parent)
+            scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+            # Title
+            CTkLabel(scroll_frame, text="Time Analysis",
+                     font=CTkFont(size=20, weight="bold")).pack(pady=20)
+
+            # Info message
+            info_frame = CTkFrame(scroll_frame)
+            info_frame.pack(fill="x", pady=10)
+
+            CTkLabel(info_frame,
+                     text="Time analysis requires a vote_history table to track individual vote timestamps.\n"
+                          "Currently showing vote counts by candidate creation time.",
+                     font=CTkFont(size=14),
+                     text_color="orange").pack(pady=10)
+
+            # Show candidates by creation time instead
+            for category in self.categories:
+                # Category header
+                CTkLabel(scroll_frame, text=category,
+                         font=CTkFont(size=16, weight="bold"),
+                         text_color="#1e40af").pack(pady=(20, 10), anchor="w")
+
+                # Get candidates for this category
+                candidates = DatabaseManager.get_candidates_by_category(category)
+
+                if not candidates:
+                    CTkLabel(scroll_frame, text="No candidates in this category",
+                             text_color="gray").pack(anchor="w", padx=20)
+                    continue
+
+                # Display candidates with their info
+                for candidate_id, name, image_path, votes in candidates:
+                    cand_frame = CTkFrame(scroll_frame)
+                    cand_frame.pack(fill="x", pady=2, padx=20)
+
+                    # Get creation time if available
+                    creation_info = f"{name} - {votes} votes"
+
+                    CTkLabel(cand_frame, text=creation_info,
+                             font=CTkFont(size=12)).pack(pady=5, padx=10, anchor="w")
+
+            # Instructions for setting up vote history
+            instructions_frame = CTkFrame(scroll_frame)
+            instructions_frame.pack(fill="x", pady=20)
+
+            CTkLabel(instructions_frame,
+                     text="To enable full time analysis:\n"
+                          "1. Create a vote_history table in your database\n"
+                          "2. Modify your voting logic to insert records into vote_history\n"
+                          "3. Each vote should record candidate_id and timestamp",
+                     font=CTkFont(size=12),
+                     text_color="gray",
+                     justify="left").pack(pady=10, padx=10, anchor="w")
+
+        except Exception as e:
+            # If there's any error, show an error message
+            error_label = CTkLabel(parent,
+                                   text=f"Error loading time analysis:\n{str(e)}",
+                                   font=CTkFont(size=14),
+                                   text_color="red")
+            error_label.pack(expand=True)
+            print(f"Error in create_time_graphs_tab: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # 5. Modify the show_voting_info method in AdminPanel class to add the new tab:
+
+    def show_voting_info(self):
+        """Show comprehensive voting information with graphs"""
+        info_window = CTkToplevel(self.admin_window)
+        info_window.title("Voting Information & Statistics")
+        info_window.geometry("1200x800")
+        info_window.grab_set()
+
+        # Center window
+        info_window.update_idletasks()
+        x = (info_window.winfo_screenwidth() // 2) - (600)
+        y = (info_window.winfo_screenheight() // 2) - (400)
+        info_window.geometry(f"1200x800+{x}+{y}")
+
+        # Header
+        header = CTkFrame(info_window, height=60, corner_radius=0,
+                          fg_color=("#1e3a8a", "#1e40af"))
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        CTkLabel(header, text="Voting Statistics & Analysis",
+                 font=CTkFont(size=24, weight="bold"),
+                 text_color="white").pack(pady=20)
+
+        # Create notebook for tabs
+        notebook_frame = CTkFrame(info_window)
+        notebook_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Tab buttons
+        tab_frame = CTkFrame(notebook_frame, height=50)
+        tab_frame.pack(fill="x", pady=(0, 10))
+        tab_frame.pack_propagate(False)
+
+        # Content frame
+        content_frame = CTkFrame(notebook_frame)
+        content_frame.pack(fill="both", expand=True)
+
+        # Initialize tabs
+        self.current_tab = "summary"
+        self.tab_contents = {}
+
+        # Tab buttons
+        summary_btn = CTkButton(tab_frame, text="Summary",
+                                command=lambda: self.switch_tab("summary", content_frame),
+                                width=100, height=35)
+        summary_btn.pack(side="left", padx=5, pady=7)
+
+        detailed_btn = CTkButton(tab_frame, text="Detailed View",
+                                 command=lambda: self.switch_tab("detailed", content_frame),
+                                 width=100, height=35)
+        detailed_btn.pack(side="left", padx=5, pady=7)
+
+        graphs_btn = CTkButton(tab_frame, text="Graphs",
+                               command=lambda: self.switch_tab("graphs", content_frame),
+                               width=100, height=35)
+        graphs_btn.pack(side="left", padx=5, pady=7)
+
+        time_graphs_btn = CTkButton(tab_frame, text="Time Analysis",
+                                    command=lambda: self.switch_tab("time_graphs", content_frame),
+                                    width=100, height=35)
+        time_graphs_btn.pack(side="left", padx=5, pady=7)
+
+        # Local switch_tab function for this window
+        def switch_tab(tab_name, content_frame):
+            """Switch between different tabs"""
+            # Clear content frame
+            for widget in content_frame.winfo_children():
+                widget.destroy()
+
+            self.current_tab = tab_name
+
+            if tab_name == "summary":
+                self.create_summary_tab(content_frame)
+            elif tab_name == "detailed":
+                self.create_detailed_tab(content_frame)
+            elif tab_name == "graphs":
+                self.create_graphs_tab(content_frame)
+            elif tab_name == "time_graphs":  # ADD THIS CONDITION
+                self.create_time_graphs_tab(content_frame)
+
+        # Update the button commands to use the local function
+        summary_btn.configure(command=lambda: switch_tab("summary", content_frame))
+        detailed_btn.configure(command=lambda: switch_tab("detailed", content_frame))
+        graphs_btn.configure(command=lambda: switch_tab("graphs", content_frame))
+        time_graphs_btn.configure(command=lambda: switch_tab("time_graphs", content_frame))
+
+        # Load initial tab
+        switch_tab("summary", content_frame)
+    # 6. Modify the switch_tab method in AdminPanel class:
+
+    def switch_tab(self, tab_name, content_frame):
+        """Switch between different tabs"""
+        # Clear content frame
+        for widget in content_frame.winfo_children():
+            widget.destroy()
+
+        self.current_tab = tab_name
+
+        if tab_name == "summary":
+            self.create_summary_tab(content_frame)
+        elif tab_name == "detailed":
+            self.create_detailed_tab(content_frame)
+        elif tab_name == "graphs":
+            self.create_graphs_tab(content_frame)
+        elif tab_name == "time_graphs":  # ADD THIS CONDITION
+            self.create_time_graphs_tab(content_frame)
+
+    def browse_image_file(self, entry_widget):
+        """Browse and select image file"""
+        file_path = filedialog.askopenfilename(
+            title="Select Candidate Image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.tiff"),
+                ("PNG files", "*.png"),
+                ("JPEG files", "*.jpg *.jpeg"),
+                ("All files", "*.*")
+            ],
+            initialdir="C:/Users/Asus/Pictures"  # Set your default directory
+        )
+        if file_path:
+            entry_widget.delete(0, 'end')
+            entry_widget.insert(0, file_path)
+
+    def __init__(self, parent_app):
+        self.parent_app = parent_app
+        self.admin_window = None
+        self.categories = ["HEAD BOY", "HEAD GIRL", "ASSISTANT HEAD BOY", "ASSISTANT HEAD GIRL"]
+
+    def show_login(self):
+        """Show admin login dialog"""
+        login_window = CTkToplevel(self.parent_app.root)
+        login_window.title("Admin Login")
+        login_window.geometry("400x300")
+        login_window.resizable(False, False)
+
+        # Center the login window
+        login_window.update_idletasks()
+        x = (login_window.winfo_screenwidth() // 2) - (200)
+        y = (login_window.winfo_screenheight() // 2) - (150)
+        login_window.geometry(f"400x300+{x}+{y}")
+
+        login_window.grab_set()  # Make window modal
+
+        # Login form
+        CTkLabel(login_window, text="Admin Access",
+                 font=CTkFont(size=24, weight="bold")).pack(pady=30)
+
+        CTkLabel(login_window, text="Enter Admin Password:",
+                 font=CTkFont(size=14)).pack(pady=10)
+
+        password_entry = CTkEntry(login_window, show="*", width=250, height=40,
+                                  font=CTkFont(size=14))
+        password_entry.pack(pady=10)
+        password_entry.focus()
+
+        error_label = CTkLabel(login_window, text="", text_color="red")
+        error_label.pack(pady=5)
+
+        def verify_password():
+            entered_password = password_entry.get()
+            if hashlib.sha256(entered_password.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
+                login_window.destroy()
+                self.show_admin_panel()
+            else:
+                error_label.configure(text="Invalid password!")
+                password_entry.delete(0, END)
+
+        def on_enter(event):
+            verify_password()
+
+        password_entry.bind("<Return>", on_enter)
+
+        CTkButton(login_window, text="Login", command=verify_password,
+                  width=150, height=40).pack(pady=20)
+
+        CTkButton(login_window, text="Cancel",
+                  command=login_window.destroy,
+                  width=150, height=40).pack(pady=5)
+
+    def show_admin_panel(self):
+        """Show the main admin panel"""
+        self.admin_window = CTkToplevel(self.parent_app.root)
+        self.admin_window.title("Election Admin Panel")
+        self.admin_window.geometry("1000x700")
+
+        # Center the admin window
+        self.admin_window.update_idletasks()
+        x = (self.admin_window.winfo_screenwidth() // 2) - (500)
+        y = (self.admin_window.winfo_screenheight() // 2) - (350)
+        self.admin_window.geometry(f"1000x700+{x}+{y}")
+
+        self.admin_window.grab_set()
+
+        # Header
+        header = CTkFrame(self.admin_window, height=80, corner_radius=0,
+                          fg_color=("#1e3a8a", "#1e40af"))
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        CTkLabel(header, text="Election Administration Panel",
+                 font=CTkFont(size=28, weight="bold"),
+                 text_color="white").pack(pady=25)
+
+        # Main content
+        main_frame = CTkFrame(self.admin_window, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Left panel - Controls
+        left_panel = CTkFrame(main_frame, width=300, corner_radius=10)
+        left_panel.pack(side="left", fill="y", padx=(0, 10))
+        left_panel.pack_propagate(False)
+
+        # Voting control section
+        CTkLabel(left_panel, text="Voting Control",
+                 font=CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+        self.voting_status_label = CTkLabel(left_panel, text="",
+                                            font=CTkFont(size=14))
+        self.voting_status_label.pack(pady=5)
+
+        self.toggle_voting_btn = CTkButton(left_panel, text="",
+                                           command=self.toggle_voting,
+                                           width=200, height=40)
+        self.toggle_voting_btn.pack(pady=10)
+
+        # Candidate management
+        CTkLabel(left_panel, text="Candidate Management",
+                 font=CTkFont(size=18, weight="bold")).pack(pady=(30, 10))
+
+        CTkButton(left_panel, text="Add Candidate",
+                  command=self.show_add_candidate,
+                  width=200, height=40).pack(pady=5)
+
+        CTkButton(left_panel, text="Reset All Votes",
+                  command=self.reset_votes,
+                  width=200, height=40,
+                  fg_color="orange", hover_color="darkorange").pack(pady=5)
+
+        CTkButton(left_panel, text="Voting Info & Stats",
+                  command=self.show_voting_info,
+                  width=200, height=40,
+                  fg_color="#059669", hover_color="#047857").pack(pady=5)
+
+        CTkButton(left_panel, text="Close Admin Panel",
+                  command=self.admin_window.destroy,
+                  width=200, height=40,
+                  fg_color="red", hover_color="darkred").pack(pady=(30, 20))
+
+        # Right panel - Candidate list
+        right_panel = CTkFrame(main_frame, corner_radius=10)
+        right_panel.pack(side="right", fill="both", expand=True)
+
+        CTkLabel(right_panel, text="Current Candidates",
+                 font=CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+        # Scrollable frame for candidates
+        self.candidates_frame = CTkScrollableFrame(right_panel, height=500)
+        self.candidates_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        self.update_voting_status_display()
+        self.refresh_candidates_list()
+
+    def update_voting_status_display(self):
+        """Update the voting status display"""
+        if hasattr(self, 'voting_status_label'):
+            is_active = DatabaseManager.get_voting_status()
+            if is_active:
+                self.voting_status_label.configure(text="Status: VOTING ACTIVE", text_color="green")
+                self.toggle_voting_btn.configure(text="Stop Voting", fg_color="red", hover_color="darkred")
+            else:
+                self.voting_status_label.configure(text="Status: VOTING STOPPED", text_color="red")
+                self.toggle_voting_btn.configure(text="Start Voting", fg_color="green", hover_color="darkgreen")
+
+    def toggle_voting(self):
+        """Toggle voting status"""
+        current_status = DatabaseManager.get_voting_status()
+        new_status = not current_status
+        DatabaseManager.set_voting_status(new_status)
+        self.update_voting_status_display()
+
+        # Update parent app status
+        if hasattr(self.parent_app, 'update_voting_access'):
+            self.parent_app.update_voting_access()
+
+        status_text = "started" if new_status else "stopped"
+        messagebox.showinfo("Voting Status", f"Voting has been {status_text}!")
+
+    def show_add_candidate(self):
+        """Show add candidate dialog"""
+        add_window = CTkToplevel(self.admin_window)
+        add_window.title("Add Candidate")
+        add_window.geometry("400x400")
+        add_window.grab_set()
+
+        # Center window
+        add_window.update_idletasks()
+        x = (add_window.winfo_screenwidth() // 2) - (200)
+        y = (add_window.winfo_screenheight() // 2) - (200)
+        add_window.geometry(f"400x400+{x}+{y}")
+
+        CTkLabel(add_window, text="Add New Candidate",
+                 font=CTkFont(size=20, weight="bold")).pack(pady=20)
+
+        # Name input
+        CTkLabel(add_window, text="Candidate Name:").pack(pady=(10, 5))
+        name_entry = CTkEntry(add_window, width=250, height=35)
+        name_entry.pack(pady=5)
+
+        # Category selection
+        CTkLabel(add_window, text="Category:").pack(pady=(15, 5))
+        category_var = StringVar(value=self.categories[0])
+        category_menu = CTkOptionMenu(add_window, values=self.categories,
+                                      variable=category_var, width=250)
+        category_menu.pack(pady=5)
+
+        # Image path input with browse button
+        CTkLabel(add_window, text="Select Image (optional):").pack(pady=(15, 5))
+
+        image_frame = CTkFrame(add_window, fg_color="transparent")
+        image_frame.pack(pady=5)
+
+        image_entry = CTkEntry(image_frame, width=180, height=35,
+                               placeholder_text="No image selected")
+        image_entry.pack(side="left", padx=(0, 5))
+
+        browse_btn = CTkButton(image_frame, text="Browse",
+                               command=lambda: self.browse_image_file(image_entry),
+                               width=60, height=35,
+                               fg_color="#059669", hover_color="#047857")
+        browse_btn.pack(side="left")
+
+        def add_candidate():
+            name = name_entry.get().strip()
+            category = category_var.get()
+            image_path = image_entry.get().strip()
+
+            if not name:
+                messagebox.showerror("Error", "Please enter candidate name!")
+                return
+
+            try:
+                DatabaseManager.add_candidate(name, category, image_path)
+                messagebox.showinfo("Success", f"Candidate '{name}' added successfully!")
+                add_window.destroy()
+                self.refresh_candidates_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to add candidate: {e}")
+
+        CTkButton(add_window, text="Add Candidate", command=add_candidate,
+                  width=150, height=40).pack(pady=20)
+
+        CTkButton(add_window, text="Cancel", command=add_window.destroy,
+                  width=150, height=40).pack(pady=5)
+
+    def refresh_candidates_list(self):
+        """Refresh the candidates list display"""
+        if not hasattr(self, 'candidates_frame'):
+            return
+
+        # Clear existing widgets
+        for widget in self.candidates_frame.winfo_children():
+            widget.destroy()
+
+        # Display candidates by category
+        for category in self.categories:
+            candidates = DatabaseManager.get_candidates_by_category(category)
+
+            # Category header
+            category_frame = CTkFrame(self.candidates_frame, fg_color="transparent")
+            category_frame.pack(fill="x", pady=(10, 5))
+
+            CTkLabel(category_frame, text=category,
+                     font=CTkFont(size=16, weight="bold"),
+                     text_color="#1e40af").pack(anchor="w")
+
+            if not candidates:
+                CTkLabel(category_frame, text="No candidates added",
+                         text_color="gray").pack(anchor="w", padx=20)
+            else:
+                for candidate_id, name, image_path, votes in candidates:
+                    candidate_frame = CTkFrame(self.candidates_frame)
+                    candidate_frame.pack(fill="x", pady=2, padx=10)
+
+                    # Candidate info
+                    info_frame = CTkFrame(candidate_frame, fg_color="transparent")
+                    info_frame.pack(side="left", fill="x", expand=True, padx=10, pady=10)
+
+                    CTkLabel(info_frame, text=name,
+                             font=CTkFont(size=14, weight="bold")).pack(anchor="w")
+                    CTkLabel(info_frame, text=f"Votes: {votes}",
+                             font=CTkFont(size=12)).pack(anchor="w")
+                    if image_path:
+                        CTkLabel(info_frame, text=f"Image: {image_path}",
+                                 font=CTkFont(size=10), text_color="gray").pack(anchor="w")
+
+                    # Delete button
+                    CTkButton(candidate_frame, text="Delete",
+                              command=lambda cid=candidate_id, cname=name: self.delete_candidate(cid, cname),
+                              width=80, height=30,
+                              fg_color="red", hover_color="darkred").pack(side="right", padx=10, pady=10)
+
+    def delete_candidate(self, candidate_id, candidate_name):
+        """Delete a candidate after confirmation"""
+        result = messagebox.askyesno("Confirm Delete",
+                                     f"Are you sure you want to delete '{candidate_name}'?")
+        if result:
+            try:
+                DatabaseManager.delete_candidate(candidate_id)
+                messagebox.showinfo("Success", f"Candidate '{candidate_name}' deleted!")
+                self.refresh_candidates_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete candidate: {e}")
+
+    def reset_votes(self):
+        """Reset all votes after confirmation"""
+        result = messagebox.askyesno("Confirm Reset",
+                                     "Are you sure you want to reset all votes to 0?")
+        if result:
+            try:
+                DatabaseManager.reset_all_votes()
+                messagebox.showinfo("Success", "All votes have been reset to 0!")
+                self.refresh_candidates_list()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to reset votes: {e}")
+
+    def show_voting_info(self):
+        """Show comprehensive voting information with graphs"""
+        info_window = CTkToplevel(self.admin_window)
+        info_window.title("Voting Information & Statistics")
+        info_window.geometry("1200x800")
+        info_window.grab_set()
+
+        # Center window
+        info_window.update_idletasks()
+        x = (info_window.winfo_screenwidth() // 2) - (600)
+        y = (info_window.winfo_screenheight() // 2) - (400)
+        info_window.geometry(f"1200x800+{x}+{y}")
+
+        # Header
+        header = CTkFrame(info_window, height=60, corner_radius=0,
+                          fg_color=("#1e3a8a", "#1e40af"))
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        CTkLabel(header, text="Voting Statistics & Analysis",
+                 font=CTkFont(size=24, weight="bold"),
+                 text_color="white").pack(pady=20)
+
+        # Create notebook for tabs
+        notebook_frame = CTkFrame(info_window)
+        notebook_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Tab buttons
+        tab_frame = CTkFrame(notebook_frame, height=50)
+        tab_frame.pack(fill="x", pady=(0, 10))
+        tab_frame.pack_propagate(False)
+
+        # Content frame
+        content_frame = CTkFrame(notebook_frame)
+        content_frame.pack(fill="both", expand=True)
+
+        # Initialize tabs
+        self.current_tab = "summary"
+        self.tab_contents = {}
+
+        # Tab buttons
+        summary_btn = CTkButton(tab_frame, text="Summary",
+                                command=lambda: self.switch_tab("summary", content_frame),
+                                width=100, height=35)
+        summary_btn.pack(side="left", padx=5, pady=7)
+
+        detailed_btn = CTkButton(tab_frame, text="Detailed View",
+                                 command=lambda: self.switch_tab("detailed", content_frame),
+                                 width=100, height=35)
+        detailed_btn.pack(side="left", padx=5, pady=7)
+
+        graphs_btn = CTkButton(tab_frame, text="Graphs",
+                               command=lambda: self.switch_tab("graphs", content_frame),
+                               width=100, height=35)
+        graphs_btn.pack(side="left", padx=5, pady=7)
+
+        # Load initial tab
+        self.switch_tab("summary", content_frame)
+
+    def switch_tab(self, tab_name, content_frame):
+        """Switch between different tabs"""
+        # Clear content frame
+        for widget in content_frame.winfo_children():
+            widget.destroy()
+
+        self.current_tab = tab_name
+
+        if tab_name == "summary":
+            self.create_summary_tab(content_frame)
+        elif tab_name == "detailed":
+            self.create_detailed_tab(content_frame)
+        elif tab_name == "graphs":
+            self.create_graphs_tab(content_frame)
+
+    def create_summary_tab(self, parent):
+        """Create summary statistics tab"""
+        scroll_frame = CTkScrollableFrame(parent)
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Get statistics
+        stats = DatabaseManager.get_voting_statistics()
+
+        # Overall statistics
+        CTkLabel(scroll_frame, text="Overall Statistics",
+                 font=CTkFont(size=20, weight="bold")).pack(pady=(0, 10))
+
+        stats_frame = CTkFrame(scroll_frame)
+        stats_frame.pack(fill="x", pady=(0, 20))
+
+        CTkLabel(stats_frame, text=f"Total Votes Cast: {stats['total_votes']}",
+                 font=CTkFont(size=16)).pack(pady=5)
+
+        # Category-wise statistics
+        CTkLabel(scroll_frame, text="Category-wise Statistics",
+                 font=CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+        for category, total_votes, candidate_count in stats['category_stats']:
+            cat_frame = CTkFrame(scroll_frame)
+            cat_frame.pack(fill="x", pady=5)
+
+            CTkLabel(cat_frame, text=f"{category}",
+                     font=CTkFont(size=14, weight="bold")).pack(pady=2)
+            CTkLabel(cat_frame, text=f"Total Votes: {total_votes} | Candidates: {candidate_count}",
+                     font=CTkFont(size=12)).pack(pady=2)
+
+        # Top candidates
+        if stats['top_candidates']:
+            CTkLabel(scroll_frame, text="Top Candidates",
+                     font=CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+            for i, (name, category, votes) in enumerate(stats['top_candidates'][:5], 1):
+                top_frame = CTkFrame(scroll_frame)
+                top_frame.pack(fill="x", pady=2)
+
+                CTkLabel(top_frame, text=f"{i}. {name} ({category}) - {votes} votes",
+                         font=CTkFont(size=14)).pack(pady=5)
+
+    def create_detailed_tab(self, parent):
+        """Create detailed candidates view tab"""
+        scroll_frame = CTkScrollableFrame(parent)
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Get all candidates
+        candidates = DatabaseManager.get_all_candidates_with_votes()
+
+        # Group by category
+        categories = {}
+        for candidate in candidates:
+            cid, name, category, votes, created_at = candidate
+            if category not in categories:
+                categories[category] = []
+            categories[category].append((name, votes, created_at))
+
+        # Display by category
+        for category in self.categories:
+            if category in categories:
+                # Category header
+                CTkLabel(scroll_frame, text=category,
+                         font=CTkFont(size=18, weight="bold"),
+                         text_color="#1e40af").pack(pady=(20, 10), anchor="w")
+
+                # Candidates in this category
+                for name, votes, created_at in categories[category]:
+                    cand_frame = CTkFrame(scroll_frame)
+                    cand_frame.pack(fill="x", pady=2)
+
+                    info_text = f"{name} - {votes} votes"
+                    if created_at:
+                        info_text += f" (Added: {created_at.strftime('%Y-%m-%d %H:%M')})"
+
+                    CTkLabel(cand_frame, text=info_text,
+                             font=CTkFont(size=14)).pack(pady=8, padx=10, anchor="w")
+
+    def create_graphs_tab(self, parent):
+        """Create graphs tab with matplotlib charts"""
+        # Create matplotlib figure
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+        fig.suptitle('Voting Statistics', fontsize=16, fontweight='bold')
+
+        # Get data
+        candidates = DatabaseManager.get_all_candidates_with_votes()
+        stats = DatabaseManager.get_voting_statistics()
+
+        # Prepare data
+        categories = defaultdict(list)
+        all_names = []
+        all_votes = []
+
+        for cid, name, category, votes, created_at in candidates:
+            categories[category].append((name, votes))
+            all_names.append(f"{name[:10]}...")  # Truncate long names
+            all_votes.append(votes)
+
+        # Chart 1: Bar chart of all candidates
+        if all_names and all_votes:
+            bars = ax1.bar(range(len(all_names)), all_votes, color='skyblue', alpha=0.8)
+            ax1.set_xlabel('Candidates')
+            ax1.set_ylabel('Votes')
+            ax1.set_title('Votes by Candidate')
+            ax1.set_xticks(range(len(all_names)))
+            ax1.set_xticklabels(all_names, rotation=45, ha='right')
+
+            # Add value labels on bars
+            for bar, vote in zip(bars, all_votes):
+                height = bar.get_height()
+                ax1.text(bar.get_x() + bar.get_width() / 2., height + 0.1,
+                         f'{vote}', ha='center', va='bottom')
+
+        # Chart 2: Pie chart of category-wise votes
+        if stats['category_stats']:
+            category_names = []
+            category_votes = []
+            for category, total_votes, candidate_count in stats['category_stats']:
+                if total_votes > 0:  # Only include categories with votes
+                    category_names.append(category)
+                    category_votes.append(total_votes)
+
+            if category_votes:
+                ax2.pie(category_votes, labels=category_names, autopct='%1.1f%%', startangle=90)
+                ax2.set_title('Vote Distribution by Category')
+
+        # Chart 3: Horizontal bar chart for top candidates
+        if len(all_names) > 0:
+            # Sort by votes for top candidates
+            sorted_data = sorted(zip(all_names, all_votes), key=lambda x: x[1], reverse=True)
+            top_names = [name for name, votes in sorted_data[:8]]  # Top 8
+            top_votes = [votes for name, votes in sorted_data[:8]]
+
+            bars = ax3.barh(range(len(top_names)), top_votes, color='lightcoral', alpha=0.8)
+            ax3.set_xlabel('Votes')
+            ax3.set_ylabel('Candidates')
+            ax3.set_title('Top Candidates (Horizontal)')
+            ax3.set_yticks(range(len(top_names)))
+            ax3.set_yticklabels(top_names)
+
+            # Add value labels
+            for i, (bar, vote) in enumerate(zip(bars, top_votes)):
+                ax3.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height() / 2,
+                         f'{vote}', ha='left', va='center')
+
+        # Chart 4: Category comparison
+        if stats['category_stats']:
+            cat_names = [cat for cat, votes, count in stats['category_stats']]
+            cat_votes = [votes for cat, votes, count in stats['category_stats']]
+            cat_candidates = [count for cat, votes, count in stats['category_stats']]
+
+            x = range(len(cat_names))
+            width = 0.35
+
+            bars1 = ax4.bar([i - width / 2 for i in x], cat_votes, width,
+                            label='Total Votes', color='lightblue', alpha=0.8)
+            bars2 = ax4.bar([i + width / 2 for i in x], cat_candidates, width,
+                            label='Number of Candidates', color='lightgreen', alpha=0.8)
+
+            ax4.set_xlabel('Categories')
+            ax4.set_ylabel('Count')
+            ax4.set_title('Votes vs Candidates by Category')
+            ax4.set_xticks(x)
+            ax4.set_xticklabels([cat[:15] + '...' if len(cat) > 15 else cat for cat in cat_names], rotation=45,
+                                ha='right')
+            ax4.legend()
+
+            # Add value labels
+            for bar in bars1:
+                height = bar.get_height()
+                ax4.text(bar.get_x() + bar.get_width() / 2., height + 0.1,
+                         f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+            for bar in bars2:
+                height = bar.get_height()
+                ax4.text(bar.get_x() + bar.get_width() / 2., height + 0.1,
+                         f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+        plt.tight_layout()
+
+        # Embed matplotlib in tkinter
+        canvas = FigureCanvasTkAgg(fig, parent)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
+
+class ElectionApp:
+    def __init__(self):
+        # Initialize database
+        DatabaseManager.initialize_database()
+
+        self.root = CTk()
+        self.root.geometry("1400x900")
+        self.root.title("BVBVM Election Management System")
+        self.root.configure(fg_color="#f0f4f8")
+
+        # Center the window
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() // 2) - (700)
+        y = (self.root.winfo_screenheight() // 2) - (450)
+        self.root.geometry(f"1400x900+{x}+{y}")
+
+        try:
+            icon = PhotoImage(file='bvblogo2.png')
+            self.root.iconphoto(True, icon)
+        except:
+            pass
+
+        self.current_category = 0
+        self.categories = ["HEAD BOY", "HEAD GIRL", "ASSISTANT HEAD BOY", "ASSISTANT HEAD GIRL"]
+        self.total_voters = 0
+        self.current_candidates = []
+        self.current_candidate_index = 0
+
+        # Initialize admin panel
+        self.admin_panel = AdminPanel(self)
+
+        self.setup_ui()
+        self.update_voting_access()
+
+    def setup_ui(self):
+        # Header section with gradient-like effect
+        self.header_frame = CTkFrame(self.root, height=120, corner_radius=0,
+                                     fg_color=("#1e3a8a", "#1e40af"))
+        self.header_frame.pack(fill="x", padx=0, pady=0)
+        self.header_frame.pack_propagate(False)
+
+        # Logo and title container
+        self.title_container = CTkFrame(self.header_frame, fg_color="transparent")
+        self.title_container.pack(expand=True, fill="both")
+
+        # Main title
+        self.main_title = CTkLabel(self.title_container,
+                                   text="BVBVM ELECTION SYSTEM 2025",
+                                   font=CTkFont(family="Segoe UI", size=36, weight="bold"),
+                                   text_color="white")
+        self.main_title.pack(pady=(20, 5))
+
+        # Subtitle
+        self.subtitle = CTkLabel(self.title_container,
+                                 text="Digital Voting Platform",
+                                 font=CTkFont(family="Segoe UI", size=16, weight="normal"),
+                                 text_color="#cbd5e1")
+        self.subtitle.pack()
+
+        # Admin button (top right)
+        self.admin_btn = CTkButton(self.header_frame, text="Admin",
+                                   command=self.admin_panel.show_login,
+                                   width=80, height=30,
+                                   fg_color="transparent", border_width=1,
+                                   border_color="white", text_color="white")
+        self.admin_btn.place(relx=0.95, rely=0.2, anchor="ne")
+
+        # Status bar
+        self.status_frame = CTkFrame(self.root, height=50, corner_radius=0,
+                                     fg_color=("#e2e8f0", "#f1f5f9"))
+        self.status_frame.pack(fill="x", padx=0, pady=0)
+        self.status_frame.pack_propagate(False)
+
+        # Current time and status
+        self.status_left = CTkLabel(self.status_frame,
+                                    text=f"Session: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                                    font=CTkFont(family="Segoe UI", size=12),
+                                    text_color="#64748b")
+        self.status_left.pack(side="left", padx=20, pady=15)
+
+        self.status_right = CTkLabel(self.status_frame,
+                                     text="Status: Ready",
+                                     font=CTkFont(family="Segoe UI", size=12),
+                                     text_color="#059669")
+        self.status_right.pack(side="right", padx=20, pady=15)
+
+        # Main content area
+        self.main_frame = CTkFrame(self.root, fg_color="transparent")
+        self.main_frame.pack(fill="both", expand=True, padx=30, pady=20)
+
+        # Category indicator with better styling
+        self.category_frame = CTkFrame(self.main_frame, height=80, corner_radius=15,
+                                       fg_color=("#ffffff", "#f8fafc"),
+                                       border_width=1, border_color="#e2e8f0")
+        self.category_frame.pack(fill="x", pady=(0, 20))
+        self.category_frame.pack_propagate(False)
+
+        self.category_label = CTkLabel(self.category_frame, text="",
+                                       font=CTkFont(family="Segoe UI", size=28, weight="bold"),
+                                       text_color="#1e40af")
+        self.category_label.pack(expand=True)
+
+        # Voting area
+        self.voting_container = CTkFrame(self.main_frame, fg_color="transparent")
+        self.voting_container.pack(fill="both", expand=True)
+
+        # Create candidate card with professional styling
+        self.candidate_card = CTkFrame(self.voting_container,
+                                       width=500, height=650,  # Made wider and taller
+                                       corner_radius=20,
+                                       fg_color=("#ffffff", "#f8fafc"),
+                                       border_width=2, border_color="#e2e8f0")
+        self.candidate_card.place(relx=0.5, rely=0.5, anchor="center")
+
+    def update_voting_access(self):
+        """Update UI based on voting status"""
+        is_voting_active = DatabaseManager.get_voting_status()
+
+        if is_voting_active:
+            self.display_category()
+            self.status_right.configure(text="Status: Voting Active", text_color="#059669")
+        else:
+            self.show_voting_inactive_message()
+            self.status_right.configure(text="Status: Voting Inactive", text_color="#dc2626")
+
+    def show_voting_inactive_message(self):
+        """Show message when voting is inactive"""
+        self.clear_candidate_card()
+        self.category_label.configure(text="VOTING NOT ACTIVE")
+
+        # Show message in candidate card
+        message_label = CTkLabel(self.candidate_card,
+                                 text="Voting is currently not active.\nPlease wait for voting to begin.",
+                                 font=CTkFont(family="Segoe UI", size=18),
+                                 text_color="#64748b")
+        message_label.pack(expand=True)
+
+    def clear_candidate_card(self):
+        for widget in self.candidate_card.winfo_children():
+            widget.destroy()
+
+    def play_success_sound(self):
+        # More pleasant success sound
+        t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+        # Two-tone success sound
+        tone1 = 0.3 * np.sin(2 * np.pi * 600 * t)
+        tone2 = 0.3 * np.sin(2 * np.pi * 800 * t)
+        success_sound = tone1 + tone2
+        # Apply fade out
+        fade = np.linspace(1, 0, len(success_sound))
+        success_sound *= fade
+        sd.play(success_sound, samplerate=fs)
+
+    def create_candidate_item(self, parent_frame, name, image_file, vote_action):
+        """Create a candidate item within a frame"""
+
+        # Create horizontal layout
+        content_frame = CTkFrame(parent_frame, fg_color="transparent")
+        content_frame.pack(fill="x", padx=15, pady=15)
+
+        # Left side - Image
+        image_frame = CTkFrame(content_frame, width=100, height=120,
+                               corner_radius=10, fg_color="#f8fafc")
+        image_frame.pack(side="left", padx=(0, 15))
+        image_frame.pack_propagate(False)
+
+        # Load image
+        try:
+            if image_file and image_file.strip():
+                actual_image_path = self.find_image_file(image_file)
+                if actual_image_path:
+                    pil_image = Image.open(actual_image_path)
+                    pil_image = pil_image.resize((80, 100), Image.Resampling.LANCZOS)
+                    image = CTkImage(light_image=pil_image, size=(80, 100))
+                    candidate_img = CTkLabel(image_frame, image=image, text='')
+                    candidate_img.pack(expand=True, padx=10, pady=10)
+                else:
+                    raise Exception("Image not found")
+            else:
+                raise Exception("No image path")
+        except Exception as e:
+            print(f"Error loading image '{image_file}': {e}")
+            placeholder = CTkLabel(image_frame, text="📷",
+                                   font=CTkFont(size=20), text_color="#94a3b8")
+            placeholder.pack(expand=True)
+
+        # Right side - Name and Vote button
+        info_frame = CTkFrame(content_frame, fg_color="transparent")
+        info_frame.pack(side="left", fill="x", expand=True)
+
+        # Candidate name
+        name_label = CTkLabel(info_frame, text=name.title(),
+                              font=CTkFont(family="Segoe UI", size=18, weight="bold"),
+                              text_color="#1e293b")
+        name_label.pack(anchor="w", pady=(10, 5))
+
+        # Vote button
+        vote_button = CTkButton(info_frame, text="VOTE",
+                                command=vote_action,
+                                font=CTkFont(family="Segoe UI", size=14, weight="bold"),
+                                fg_color="#1e40af", hover_color="#1e3a8a",
+                                corner_radius=8, width=120, height=35)
+        vote_button.pack(anchor="w", pady=(5, 10))
+
+    def find_image_file(self, base_path):
+        """Find image file with common extensions"""
+        import os
+        extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff']
+
+        if os.path.exists(base_path):
+            return base_path
+
+        for ext in extensions:
+            full_path = base_path + ext
+            if os.path.exists(full_path):
+                return full_path
+
+        return None
+
+    def update_status(self, message, color="#059669"):
+        self.status_right.configure(text=f"Status: {message}", text_color=color)
+
+    def next_category(self):
+        self.current_category += 1
+        if self.current_category >= len(self.categories):
+            self.show_completion_message()
+        else:
+            self.display_category()
+
+    def show_completion_message(self):
+        # Hide the candidate card
+        self.candidate_card.place_forget()
+
+        self.category_label.configure(text="VOTING COMPLETED")
+        self.update_status("Vote Submitted Successfully", "#059669")
+
+        # Success icon (using text symbol) - displayed on main screen
+        success_icon = CTkLabel(self.voting_container,
+                                text="✓",
+                                font=CTkFont(family="Segoe UI", size=120, weight="bold"),
+                                text_color="#10b981")
+        success_icon.place(relx=0.5, rely=0.25, anchor="center")
+
+        # Thank you message - displayed on main screen
+        thank_you = CTkLabel(self.voting_container,
+                             text="Thank You for Voting!",
+                             font=CTkFont(family="Segoe UI", size=36, weight="bold"),
+                             text_color="#1e40af")
+        thank_you.place(relx=0.5, rely=0.4, anchor="center")
+
+        # Sub message - displayed on main screen
+        sub_message = CTkLabel(self.voting_container,
+                               text="Your vote has been recorded securely",
+                               font=CTkFont(family="Segoe UI", size=18),
+                               text_color="#64748b")
+        sub_message.place(relx=0.5, rely=0.5, anchor="center")
+
+        # New voter button - displayed on main screen
+        new_voter_btn = CTkButton(self.voting_container,
+                                  text="New Voter",
+                                  command=self.restart_voting,
+                                  font=CTkFont(family="Segoe UI", size=18, weight="bold"),
+                                  fg_color="#1e40af",
+                                  hover_color="#1e3a8a",
+                                  corner_radius=12,
+                                  width=200,
+                                  height=50)
+        new_voter_btn.place(relx=0.5, rely=0.65, anchor="center")
+
+        # Update total voters count
+        self.total_voters += 1
+
+    def restart_voting(self):
+        # Clear all completion message elements and any grid containers
+        for widget in self.voting_container.winfo_children():
+            if widget != self.candidate_card:
+                widget.destroy()
+
+        # Show the candidate card again
+        self.candidate_card.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.current_category = 0
+        self.current_candidate_index = 0
+        self.update_status("Ready", "#059669")
+
+        # Check if voting is still active
+        if DatabaseManager.get_voting_status():
+            self.display_category()
+        else:
+            self.show_voting_inactive_message()
+
+    def display_category(self):
+        if not DatabaseManager.get_voting_status():
+            self.show_voting_inactive_message()
+            return
+
+        self.clear_candidate_card()
+        self.category_label.configure(text=f"SELECT {self.categories[self.current_category]}")
+        self.update_status("Voting in Progress", "#2563eb")
+
+        # Get candidates for current category
+        self.current_candidates = DatabaseManager.get_candidates_by_category(self.categories[self.current_category])
+
+        self.display_all_candidates()  # Changed from display_current_candidate()
+
+    def display_all_candidates(self):
+        """Display all candidates for the current category in individual tiles"""
+        if not self.current_candidates:
+            # No candidates available
+            no_candidate_label = CTkLabel(self.candidate_card,
+                                          text="No candidates available\nfor this category",
+                                          font=CTkFont(family="Segoe UI", size=18),
+                                          text_color="#64748b")
+            no_candidate_label.pack(expand=True)
+            # Skip to next category after delay
+            self.root.after(2000, self.next_category)
+            return
+
+        # Hide the single candidate card
+        self.candidate_card.place_forget()
+
+        # Create grid container for candidate tiles
+        grid_container = CTkFrame(self.voting_container, fg_color="transparent")
+        grid_container.pack(fill="both", expand=True, pady=20)
+
+        # Calculate grid layout based on number of candidates
+        num_candidates = len(self.current_candidates)
+        if num_candidates <= 5:
+            cols = 5
+            rows = 1
+        elif num_candidates <= 10:
+            cols = 5
+            rows = 2
+
+
+        # Create candidate tiles
+        for i, candidate_data in enumerate(self.current_candidates):
+            candidate_id, name, image_path, votes = candidate_data
+
+            # Calculate position
+            row = i // cols
+            col = i % cols
+
+            # Create candidate tile
+            tile_frame = CTkFrame(grid_container,
+                                  width=350, height=450,
+                                  corner_radius=20,
+                                  fg_color=("#ffffff", "#f8fafc"),
+                                  border_width=2, border_color="#e2e8f0")
+
+            # Position the tile in grid
+            tile_frame.grid(row=row, column=col, padx=20, pady=15, sticky="nsew")
+            tile_frame.grid_propagate(False)
+
+            # Configure grid weights for centering
+            grid_container.grid_rowconfigure(row, weight=1)
+            grid_container.grid_columnconfigure(col, weight=1)
+
+            # Photo container
+            photo_container = CTkFrame(tile_frame,
+                                       width=280, height=300,
+                                       corner_radius=15,
+                                       fg_color="#f8fafc",
+                                       border_width=1,
+                                       border_color="#e2e8f0")
+            photo_container.pack(pady=(20, 15))
+            photo_container.pack_propagate(False)
+
+            # Load and display image
+            try:
+                if image_path and image_path.strip():
+                    actual_image_path = self.find_image_file(image_path)
+                    if actual_image_path:
+                        pil_image = Image.open(actual_image_path)
+                        pil_image = pil_image.resize((250, 280), Image.Resampling.LANCZOS)
+                        image = CTkImage(light_image=pil_image, size=(250, 280))
+                        candidate_img = CTkLabel(photo_container, image=image, text='')
+                        candidate_img.pack(expand=True, padx=15, pady=10)
+                    else:
+                        raise Exception("Image not found")
+                else:
+                    raise Exception("No image path")
+            except Exception as e:
+                print(f"Error loading image '{image_path}': {e}")
+                placeholder = CTkLabel(photo_container,
+                                       text="📷\nPhoto",
+                                       font=CTkFont(family="Segoe UI", size=24),
+                                       text_color="#94a3b8")
+                placeholder.pack(expand=True)
+
+            # Candidate name
+            name_label = CTkLabel(tile_frame,
+                                  text=name.title(),
+                                  font=CTkFont(family="Segoe UI", size=18, weight="bold"),
+                                  text_color="#1e293b")
+            name_label.pack(pady=(0, 10))
+
+            # Vote button
+            def create_vote_action(cid, cname, cvotes):
+                def vote_action():
+                    # Update vote count
+                    new_votes = cvotes + 1
+                    DatabaseManager.update_candidate_votes(cid, new_votes)
+                    # Record vote in history table
+                    DatabaseManager.record_vote_history(cid)  # ADD THIS LINE
+                    print(f"{cname} votes: {new_votes}")
+                    self.play_success_sound()
+                    # Clear the grid and show completion
+                    grid_container.destroy()
+                    self.candidate_card.place(relx=0.5, rely=0.5, anchor="center")
+                    self.root.after(500, self.next_category)
+
+                return vote_action
+
+            vote_button = CTkButton(tile_frame,
+                                    text="VOTE",
+                                    command=create_vote_action(candidate_id, name, votes),
+                                    font=CTkFont(family="Segoe UI", size=16, weight="bold"),
+                                    fg_color="#1e40af",
+                                    hover_color="#1e3a8a",
+                                    corner_radius=12,
+                                    width=150,
+                                    height=40)
+            vote_button.pack(pady=(0, 20))
+    def create_candidate_display(self, name, image_file, vote_action):
+        # Photo container with border
+        photo_container = CTkFrame(self.candidate_card,
+                                   width=300, height=350,
+                                   corner_radius=15,
+                                   fg_color="#f8fafc",
+                                   border_width=1,
+                                   border_color="#e2e8f0")
+        photo_container.pack(pady=(30, 20))
+        photo_container.pack_propagate(False)
+        try:
+            if image_file and image_file.strip():  # Check if image_file exists and is not empty
+                pil_image = Image.open(image_file)
+                # Resize image to fit the container properly
+                pil_image = pil_image.resize((250, 300), Image.Resampling.LANCZOS)
+                image = CTkImage(light_image=pil_image, size=(250, 300))
+                candidate_img = CTkLabel(photo_container, image=image, text='')
+                candidate_img.pack(expand=True, fill="both", padx=10, pady=10)
+            else:
+                raise Exception("No image path")
+        except Exception as e:
+            print(f"Error loading image '{image_file}': {e}")  # Debug print
+            # Fallback with professional placeholder
+            placeholder = CTkLabel(photo_container,
+                                   text="📷\nPhoto",
+                                   font=CTkFont(family="Segoe UI", size=24),
+                                   text_color="#94a3b8")
+            placeholder.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Candidate name with better typography
+        name_label = CTkLabel(self.candidate_card,
+                              text=name.title(),
+                              font=CTkFont(family="Segoe UI", size=22, weight="bold"),
+                              text_color="#1e293b")
+        name_label.pack(pady=(0, 10))
+
+        # Position indicator
+        position_label = CTkLabel(self.candidate_card,
+                                  text=f"Candidate for {self.categories[self.current_category]}",
+                                  font=CTkFont(family="Segoe UI", size=12),
+                                  text_color="#64748b")
+        position_label.pack(pady=(0, 30))
+
+        # Vote button with professional styling
+        vote_button = CTkButton(self.candidate_card,
+                                text="CAST VOTE",
+                                command=vote_action,
+                                font=CTkFont(family="Segoe UI", size=18, weight="bold"),
+                                fg_color="#1e40af",
+                                hover_color="#1e3a8a",
+                                corner_radius=12,
+                                width=200,
+                                height=50)
+        vote_button.pack(pady=10)
+
+        # Add subtle instruction
+        instruction = CTkLabel(self.candidate_card,
+                               text="Click to vote for this candidate",
+                               font=CTkFont(family="Segoe UI", size=11),
+                               text_color="#94a3b8")
+        instruction.pack(pady=(5, 0))
+
+    def run(self):
+        self.root.mainloop()
+
+
+# Run the application
+if __name__ == "__main__":
+    app = ElectionApp()
+    app.run()
