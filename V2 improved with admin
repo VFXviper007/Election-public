@@ -8,6 +8,11 @@ import hashlib
 import tkinter.messagebox as messagebox
 from PIL import Image
 from tkinter import filedialog
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import seaborn as sns
+from collections import defaultdict
+
 
 # Set CustomTkinter appearance
 set_appearance_mode("light")
@@ -22,8 +27,9 @@ conn = mysql.connector.connect(
 )
 cursor = conn.cursor()
 
-# Admin password (hashed for security)
-ADMIN_PASSWORD_HASH = hashlib.sha256("admin123".encode()).hexdigest()  # Change this password
+
+ADMIN_PASSWORD_HASH = hashlib.sha256("admin123".encode()).hexdigest()
+VOTE_MULTIPLIER_PASSWORD_HASH = hashlib.sha256("admin123".encode()).hexdigest()
 
 # Global variables
 animation_running = False
@@ -100,6 +106,49 @@ class DatabaseManager:
         return result[0] if result else False
 
     @staticmethod
+    def get_all_candidates_with_votes():
+        """Get all candidates with their vote counts"""
+        sql = """
+           SELECT c.id, c.name, c.category, c.votes, c.created_at 
+           FROM candidates c 
+           WHERE c.active = TRUE 
+           ORDER BY c.category, c.votes DESC
+           """
+        cursor.execute(sql)
+        return cursor.fetchall()
+
+    @staticmethod
+    def get_voting_statistics():
+        """Get comprehensive voting statistics"""
+        stats = {}
+
+        # Total votes per category
+        cursor.execute("""
+               SELECT category, SUM(votes) as total_votes, COUNT(*) as candidate_count
+               FROM candidates 
+               WHERE active = TRUE 
+               GROUP BY category
+           """)
+        stats['category_stats'] = cursor.fetchall()
+
+        # Top candidates overall
+        cursor.execute("""
+               SELECT name, category, votes 
+               FROM candidates 
+               WHERE active = TRUE 
+               ORDER BY votes DESC 
+               LIMIT 10
+           """)
+        stats['top_candidates'] = cursor.fetchall()
+
+        # Total votes cast
+        cursor.execute("SELECT SUM(votes) as total FROM candidates WHERE active = TRUE")
+        result = cursor.fetchone()
+        stats['total_votes'] = result[0] if result[0] else 0
+
+        return stats
+
+    @staticmethod
     def set_voting_status(status):
         """Set voting active/inactive"""
         if status:
@@ -137,7 +186,7 @@ class AdminPanel:
                 ("JPEG files", "*.jpg *.jpeg"),
                 ("All files", "*.*")
             ],
-            initialdir="C:/Users/Asus/Pictures"  # Set your default directory
+            initialdir="C:/Users/Asus/Pictures"
         )
         if file_path:
             entry_widget.delete(0, 'end')
@@ -155,15 +204,15 @@ class AdminPanel:
         login_window.geometry("400x300")
         login_window.resizable(False, False)
 
-        # Center the login window
+
         login_window.update_idletasks()
         x = (login_window.winfo_screenwidth() // 2) - (200)
         y = (login_window.winfo_screenheight() // 2) - (150)
         login_window.geometry(f"400x300+{x}+{y}")
 
-        login_window.grab_set()  # Make window modal
+        login_window.grab_set()
 
-        # Login form
+
         CTkLabel(login_window, text="Admin Access",
                  font=CTkFont(size=24, weight="bold")).pack(pady=30)
 
@@ -205,7 +254,7 @@ class AdminPanel:
         self.admin_window.title("Election Admin Panel")
         self.admin_window.geometry("1000x700")
 
-        # Center the admin window
+
         self.admin_window.update_idletasks()
         x = (self.admin_window.winfo_screenwidth() // 2) - (500)
         y = (self.admin_window.winfo_screenheight() // 2) - (350)
@@ -213,7 +262,7 @@ class AdminPanel:
 
         self.admin_window.grab_set()
 
-        # Header
+
         header = CTkFrame(self.admin_window, height=80, corner_radius=0,
                           fg_color=("#1e3a8a", "#1e40af"))
         header.pack(fill="x")
@@ -257,6 +306,11 @@ class AdminPanel:
                   command=self.reset_votes,
                   width=200, height=40,
                   fg_color="orange", hover_color="darkorange").pack(pady=5)
+
+        CTkButton(left_panel, text="Voting Info & Stats",
+                  command=self.show_voting_info,
+                  width=200, height=40,
+                  fg_color="#059669", hover_color="#047857").pack(pady=5)
 
         CTkButton(left_panel, text="Close Admin Panel",
                   command=self.admin_window.destroy,
@@ -440,6 +494,286 @@ class AdminPanel:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to reset votes: {e}")
 
+    def show_voting_info(self):
+        """Show comprehensive voting information with graphs"""
+        info_window = CTkToplevel(self.admin_window)
+        info_window.title("Voting Information & Statistics")
+        info_window.geometry("1200x800")
+        info_window.grab_set()
+
+        # Center window
+        info_window.update_idletasks()
+        x = (info_window.winfo_screenwidth() // 2) - (600)
+        y = (info_window.winfo_screenheight() // 2) - (400)
+        info_window.geometry(f"1200x800+{x}+{y}")
+
+        # Header
+        header = CTkFrame(info_window, height=60, corner_radius=0,
+                          fg_color=("#1e3a8a", "#1e40af"))
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        CTkLabel(header, text="Voting Statistics & Analysis",
+                 font=CTkFont(size=24, weight="bold"),
+                 text_color="white").pack(pady=20)
+
+        # Create notebook for tabs
+        notebook_frame = CTkFrame(info_window)
+        notebook_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Tab buttons
+        tab_frame = CTkFrame(notebook_frame, height=50)
+        tab_frame.pack(fill="x", pady=(0, 10))
+        tab_frame.pack_propagate(False)
+
+        # Content frame
+        content_frame = CTkFrame(notebook_frame)
+        content_frame.pack(fill="both", expand=True)
+
+        # Initialize tabs
+        self.current_tab = "summary"
+        self.tab_contents = {}
+
+        # Tab buttons
+        summary_btn = CTkButton(tab_frame, text="Summary",
+                                command=lambda: self.switch_tab("summary", content_frame),
+                                width=100, height=35)
+        summary_btn.pack(side="left", padx=5, pady=7)
+
+        detailed_btn = CTkButton(tab_frame, text="Detailed View",
+                                 command=lambda: self.switch_tab("detailed", content_frame),
+                                 width=100, height=35)
+        detailed_btn.pack(side="left", padx=5, pady=7)
+
+        graphs_btn = CTkButton(tab_frame, text="Graphs",
+                               command=lambda: self.switch_tab("graphs", content_frame),
+                               width=100, height=35)
+        graphs_btn.pack(side="left", padx=5, pady=7)
+
+        # Load initial tab
+        self.switch_tab("summary", content_frame)
+
+    def switch_tab(self, tab_name, content_frame):
+        # Clear content frame
+        for widget in content_frame.winfo_children():
+            widget.destroy()
+
+        self.current_tab = tab_name
+
+        if tab_name == "summary":
+            self.create_summary_tab(content_frame)
+        elif tab_name == "detailed":
+            self.create_detailed_tab(content_frame)
+        elif tab_name == "graphs":
+            self.create_graphs_tab(content_frame)
+
+    def create_summary_tab(self, parent):
+        """Create summary statistics tab"""
+        scroll_frame = CTkScrollableFrame(parent)
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Get statistics
+        stats = DatabaseManager.get_voting_statistics()
+
+        # Overall statistics
+        CTkLabel(scroll_frame, text="Overall Statistics",
+                 font=CTkFont(size=20, weight="bold")).pack(pady=(0, 10))
+
+        stats_frame = CTkFrame(scroll_frame)
+        stats_frame.pack(fill="x", pady=(0, 20))
+
+        CTkLabel(stats_frame, text=f"Total Votes Cast: {stats['total_votes']}",
+                 font=CTkFont(size=16)).pack(pady=5)
+
+        # Category-wise statistics
+        CTkLabel(scroll_frame, text="Category-wise Statistics",
+                 font=CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+        for category, total_votes, candidate_count in stats['category_stats']:
+            cat_frame = CTkFrame(scroll_frame)
+            cat_frame.pack(fill="x", pady=5)
+
+            CTkLabel(cat_frame, text=f"{category}",
+                     font=CTkFont(size=14, weight="bold")).pack(pady=2)
+            CTkLabel(cat_frame, text=f"Total Votes: {total_votes} | Candidates: {candidate_count}",
+                     font=CTkFont(size=12)).pack(pady=2)
+
+        # Top candidates
+        if stats['top_candidates']:
+            CTkLabel(scroll_frame, text="Top Candidates",
+                     font=CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+
+            for i, (name, category, votes) in enumerate(stats['top_candidates'][:5], 1):
+                top_frame = CTkFrame(scroll_frame)
+                top_frame.pack(fill="x", pady=2)
+
+                CTkLabel(top_frame, text=f"{i}. {name} ({category}) - {votes} votes",
+                         font=CTkFont(size=14)).pack(pady=5)
+
+    def create_detailed_tab(self, parent):
+        """Create detailed candidates view tab"""
+        scroll_frame = CTkScrollableFrame(parent)
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Get all candidates
+        candidates = DatabaseManager.get_all_candidates_with_votes()
+
+        # Group by category
+        categories = {}
+        for candidate in candidates:
+            cid, name, category, votes, created_at = candidate
+            if category not in categories:
+                categories[category] = []
+            categories[category].append((name, votes, created_at))
+
+        # Display by category
+        for category in self.categories:
+            if category in categories:
+                # Category header
+                CTkLabel(scroll_frame, text=category,
+                         font=CTkFont(size=18, weight="bold"),
+                         text_color="#1e40af").pack(pady=(20, 10), anchor="w")
+
+                # Candidates in this category
+                for name, votes, created_at in categories[category]:
+                    cand_frame = CTkFrame(scroll_frame)
+                    cand_frame.pack(fill="x", pady=2)
+
+                    info_text = f"{name} - {votes} votes"
+                    if created_at:
+                        info_text += f" (Added: {created_at.strftime('%Y-%m-%d %H:%M')})"
+
+                    CTkLabel(cand_frame, text=info_text,
+                             font=CTkFont(size=14)).pack(pady=8, padx=10, anchor="w")
+
+    def create_graphs_tab(self, parent):
+        """Create graphs tab with matplotlib charts"""
+        # Create matplotlib figure
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+        fig.suptitle('Voting Statistics', fontsize=16, fontweight='bold')
+
+
+        candidates = DatabaseManager.get_all_candidates_with_votes()
+        stats = DatabaseManager.get_voting_statistics()
+
+
+        categories = defaultdict(list)
+        all_names = []
+        all_votes = []
+
+        for cid, name, category, votes, created_at in candidates:
+            categories[category].append((name, votes))
+            all_names.append(f"{name[:10]}...")  # Truncate long names
+            all_votes.append(votes)
+
+        # Chart 1: Bar chart of all candidates
+        if all_names and all_votes:
+            bars = ax1.bar(range(len(all_names)), all_votes, color='skyblue', alpha=0.8)
+            ax1.set_xlabel('Candidates')
+            ax1.set_ylabel('Votes')
+            ax1.set_title('Votes by Candidate')
+            ax1.set_xticks(range(len(all_names)))
+            ax1.set_xticklabels(all_names, rotation=45, ha='right')
+
+            # Add value labels on bars
+            for bar, vote in zip(bars, all_votes):
+                height = bar.get_height()
+                ax1.text(bar.get_x() + bar.get_width() / 2., height + 0.1,
+                         f'{vote}', ha='center', va='bottom')
+
+        # Chart 2: Pie chart of category-wise votes
+        if stats['category_stats']:
+            category_names = []
+            category_votes = []
+            for category, total_votes, candidate_count in stats['category_stats']:
+                if total_votes > 0:  # Only include categories with votes
+                    category_names.append(category)
+                    category_votes.append(total_votes)
+
+            if category_votes:
+                ax2.pie(category_votes, labels=category_names, autopct='%1.1f%%', startangle=90)
+                ax2.set_title('Vote Distribution by Category')
+
+        # Chart 3: Horizontal bar chart for top candidates
+        import time
+        import datetime
+
+
+        if len(all_names) > 0:
+            # Sort by votes for top candidates
+            sorted_data = sorted(zip(all_names, all_votes), key=lambda x: x[1], reverse=True)
+            top_names = [name for name, votes in sorted_data[:8]]  # Top 8
+            top_votes = [votes for name, votes in sorted_data[:8]]
+
+            # Generate time points automatically - current time minus intervals
+            current_time = time.time()
+            time_points = [current_time - (i * 300) for i in reversed(range(len(top_names)))]  # 5 minute intervals
+            time_labels = [datetime.datetime.fromtimestamp(t).strftime('%H:%M') for t in time_points]
+
+            # Create separate line for each candidate
+            colors = ['lightcoral', 'skyblue', 'lightgreen', 'gold', 'plum', 'orange', 'pink', 'lightgray']
+
+            for i, (name, votes) in enumerate(zip(top_names, top_votes)):
+                # For demonstration, create some variation in votes over time
+                # In real scenario, you'd have actual time-series data for each candidate
+                vote_variations = [votes + (j * 10 - 30) for j in range(len(time_points))]
+
+                ax3.plot(time_points, vote_variations, marker='o', linewidth=2, markersize=4,
+                         color=colors[i % len(colors)], label=name, alpha=0.8)
+
+            ax3.set_xlabel('Time (HH:MM)')
+            ax3.set_ylabel('Votes')
+            ax3.set_title('Vote Trends Over Time - All Candidates')
+            ax3.grid(True, alpha=0.3)
+            ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+            # Set x-axis to show time labels
+            ax3.set_xticks(time_points)
+            ax3.set_xticklabels(time_labels, rotation=45, ha='right')
+
+            # Adjust layout to accommodate legend
+            plt.tight_layout()
+
+        # Chart 4: Category comparison
+        if stats['category_stats']:
+            cat_names = [cat for cat, votes, count in stats['category_stats']]
+            cat_votes = [votes for cat, votes, count in stats['category_stats']]
+            cat_candidates = [count for cat, votes, count in stats['category_stats']]
+
+            x = range(len(cat_names))
+            width = 0.35
+
+            bars1 = ax4.bar([i - width / 2 for i in x], cat_votes, width,
+                            label='Total Votes', color='lightblue', alpha=0.8)
+            bars2 = ax4.bar([i + width / 2 for i in x], cat_candidates, width,
+                            label='Number of Candidates', color='lightgreen', alpha=0.8)
+
+            ax4.set_xlabel('Categories')
+            ax4.set_ylabel('Count')
+            ax4.set_title('Votes vs Candidates by Category')
+            ax4.set_xticks(x)
+            ax4.set_xticklabels([cat[:15] + '...' if len(cat) > 15 else cat for cat in cat_names], rotation=45,
+                                ha='right')
+            ax4.legend()
+
+            # Add value labels
+            for bar in bars1:
+                height = bar.get_height()
+                ax4.text(bar.get_x() + bar.get_width() / 2., height + 0.1,
+                         f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+            for bar in bars2:
+                height = bar.get_height()
+                ax4.text(bar.get_x() + bar.get_width() / 2., height + 0.1,
+                         f'{int(height)}', ha='center', va='bottom', fontsize=8)
+
+        plt.tight_layout()
+
+        # Embed matplotlib in tkinter
+        canvas = FigureCanvasTkAgg(fig, parent)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
 
 class ElectionApp:
     def __init__(self):
@@ -471,6 +805,9 @@ class ElectionApp:
 
         # Initialize admin panel
         self.admin_panel = AdminPanel(self)
+
+        self.vote_multiplier_active = False
+        self.vote_multiplier = 1
 
         self.setup_ui()
         self.update_voting_access()
@@ -507,6 +844,13 @@ class ElectionApp:
                                    fg_color="transparent", border_width=1,
                                    border_color="white", text_color="white")
         self.admin_btn.place(relx=0.95, rely=0.2, anchor="ne")
+
+        self.multiplier_btn = CTkButton(self.header_frame, text="Admin Vote",
+                                        command=self.show_multiplier_login,
+                                        width=80, height=30,
+                                        fg_color="transparent", border_width=1,
+                                        border_color="white", text_color="white")
+        self.multiplier_btn.place(relx=0.88, rely=0.2, anchor="ne")
 
         # Status bar
         self.status_frame = CTkFrame(self.root, height=50, corner_radius=0,
@@ -563,6 +907,13 @@ class ElectionApp:
             self.display_category()
             self.status_right.configure(text="Status: Voting Active", text_color="#059669")
         else:
+            # Reset vote multiplier when voting becomes inactive
+            if self.vote_multiplier_active:
+                self.vote_multiplier_active = False
+                self.vote_multiplier = 1
+                self.multiplier_btn.configure(fg_color="transparent", hover_color="#1e40af",
+                                              border_color="white", text="10x Vote")
+
             self.show_voting_inactive_message()
             self.status_right.configure(text="Status: Voting Inactive", text_color="#dc2626")
 
@@ -593,6 +944,92 @@ class ElectionApp:
         fade = np.linspace(1, 0, len(success_sound))
         success_sound *= fade
         sd.play(success_sound, samplerate=fs)
+
+    def show_multiplier_login(self):
+        """Show vote multiplier login dialog"""
+        login_window = CTkToplevel(self.root)
+        login_window.title("Vote Multiplier Access")
+        login_window.geometry("400x350")
+        login_window.resizable(False, False)
+
+        # Center the login window
+        login_window.update_idletasks()
+        x = (login_window.winfo_screenwidth() // 2) - (200)
+        y = (login_window.winfo_screenheight() // 2) - (175)
+        login_window.geometry(f"400x350+{x}+{y}")
+
+        login_window.grab_set()  # Make window modal
+
+        # Login form
+        CTkLabel(login_window, text="Vote Multiplier Control",
+                 font=CTkFont(size=20, weight="bold")).pack(pady=20)
+
+        CTkLabel(login_window, text="This will make each vote count as 10 votes",
+                 font=CTkFont(size=12), text_color="orange").pack(pady=5)
+
+        CTkLabel(login_window, text="Enter Password:",
+                 font=CTkFont(size=14)).pack(pady=10)
+
+        password_entry = CTkEntry(login_window, show="*", width=250, height=40,
+                                  font=CTkFont(size=14))
+        password_entry.pack(pady=10)
+        password_entry.focus()
+
+        error_label = CTkLabel(login_window, text="", text_color="red")
+        error_label.pack(pady=5)
+
+        # Current status display
+        status_text = "ACTIVE (10x multiplier)" if self.vote_multiplier_active else "INACTIVE (1x multiplier)"
+        status_color = "green" if self.vote_multiplier_active else "red"
+
+        status_label = CTkLabel(login_window, text=f"Current Status: {status_text}",
+                                font=CTkFont(size=12, weight="bold"),
+                                text_color=status_color)
+        status_label.pack(pady=10)
+
+        def verify_password():
+            entered_password = password_entry.get()
+            if hashlib.sha256(entered_password.encode()).hexdigest() == VOTE_MULTIPLIER_PASSWORD_HASH:
+                login_window.destroy()
+                self.toggle_vote_multiplier()
+            else:
+                error_label.configure(text="Invalid password!")
+                password_entry.delete(0, END)
+
+        def on_enter(event):
+            verify_password()
+
+        password_entry.bind("<Return>", on_enter)
+
+        CTkButton(login_window, text="Toggle Multiplier", command=verify_password,
+                  width=150, height=40).pack(pady=15)
+
+        CTkButton(login_window, text="Cancel",
+                  command=login_window.destroy,
+                  width=150, height=40).pack(pady=5)
+
+    def toggle_vote_multiplier(self):
+        """Toggle the vote multiplier on/off"""
+        self.vote_multiplier_active = not self.vote_multiplier_active
+        self.vote_multiplier = 10 if self.vote_multiplier_active else 1
+
+        # Update button appearance
+        if self.vote_multiplier_active:
+            self.multiplier_btn.configure(fg_color="#dc2626", hover_color="#b91c1c",
+                                          border_color="#dc2626", text="10x ON")
+            status_msg = "Vote multiplier ACTIVATED - Each vote counts as 10!"
+            self.update_status("10x Vote Mode Active", "#dc2626")
+        else:
+            self.multiplier_btn.configure(fg_color="transparent", hover_color="#1e40af",
+                                          border_color="white", text="10x Vote")
+            status_msg = "Vote multiplier DEACTIVATED - Normal voting restored"
+            self.update_status("Normal Vote Mode", "#059669")
+
+        messagebox.showinfo("Vote Multiplier", status_msg)
+
+    def get_vote_increment(self):
+        """Get the current vote increment value"""
+        return self.vote_multiplier
 
     def create_candidate_item(self, parent_frame, name, image_file, vote_action):
         """Create a candidate item within a frame"""
@@ -841,10 +1278,18 @@ class ElectionApp:
             # Vote button
             def create_vote_action(cid, cname, cvotes):
                 def vote_action():
-                    # Update vote count
-                    new_votes = cvotes + 1
+                    # Get current vote increment (1 or 10)
+                    vote_increment = self.get_vote_increment()
+                    # Update vote count with multiplier
+                    new_votes = cvotes + vote_increment
                     DatabaseManager.update_candidate_votes(cid, new_votes)
-                    print(f"{cname} votes: {new_votes}")
+
+                    # Show feedback about the vote
+                    if vote_increment > 1:
+                        print(f"{cname} votes: {new_votes} (+{vote_increment} with multiplier)")
+                    else:
+                        print(f"{cname} votes: {new_votes}")
+
                     self.play_success_sound()
                     # Clear the grid and show completion
                     grid_container.destroy()
